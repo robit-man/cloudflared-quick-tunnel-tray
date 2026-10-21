@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cloudflare Quick Tunnel
+Comment=Create and cycle per-user Cloudflare Quick Tunnels
+Icon=network-vpn-symbolic
+Exec=/usr/local/bin/cloudflared-quick-tunnel-indicator
+Terminal=false
+Categories=Network;
+StartupNotify=false
+NoDisplay=false

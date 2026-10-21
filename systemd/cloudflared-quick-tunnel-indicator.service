@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare Quick Tunnel tray indicator
+Documentation=https://github.com/robit-man/cloudflared-quick-tunnel-tray
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared-quick-tunnel-indicator
+ExecStopPost=-/usr/local/bin/cloudflared-quick-tunnelctl stop
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=graphical-session.target
