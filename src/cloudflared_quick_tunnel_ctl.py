@@ -69,11 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     for action in ("start", "cycle"):
         command = subparsers.add_parser(action)
-        command.add_argument(
+        target = command.add_mutually_exclusive_group()
+        target.add_argument(
             "--port",
             type=int,
             default=None,
             help="local TCP port (start defaults to 22; cycle keeps the current port)",
+        )
+        target.add_argument(
+            "--browser", action="store_true", help="publish the browser terminal for local SSH",
         )
         add_json_option(command, suppress_default=True)
     return parser
@@ -84,11 +88,12 @@ def print_human(response: dict[str, Any], action: str) -> None:
         print(f"service {response.get('version', 'unknown')}")
         return
     if action in {"start", "cycle"} and response.get("endpoint"):
-        print(response["endpoint"])
+        print(response.get("browser_url") or response["endpoint"])
         return
     state = response.get("state", "unknown")
     if state == "ready":
-        print(f"ready {response['endpoint']} -> localhost:{response['port']}")
+        target = "browser terminal (local SSH)" if response.get("mode") == "browser-tty" else f"localhost:{response['port']}"
+        print(f"ready {response['endpoint']} -> {target}")
     elif state == "error":
         print(f"error: {response.get('last_error') or 'unknown error'}")
     else:
@@ -98,8 +103,11 @@ def print_human(response: dict[str, Any], action: str) -> None:
 def main() -> int:
     args = build_parser().parse_args()
     payload: dict[str, Any] = {"action": args.action}
-    if args.action in {"start", "cycle"} and args.port is not None:
-        payload["port"] = args.port
+    if args.action in {"start", "cycle"}:
+        if args.browser:
+            payload["mode"] = "browser-tty"
+        elif args.port is not None:
+            payload["port"] = args.port
     try:
         response = request(payload)
     except RuntimeError as exc:

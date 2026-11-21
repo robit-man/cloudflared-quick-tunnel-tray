@@ -15,7 +15,7 @@ UMask=0022
 KillMode=control-group
 TimeoutStopSec=15s
 
-# The broker starts cloudflared as the requesting UID, so it only retains the
+# The broker starts tunnel processes as the requesting UID, so it only retains the
 # capabilities needed to drop identity and terminate those child processes.
 CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_KILL
 NoNewPrivileges=yes

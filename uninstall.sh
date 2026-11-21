@@ -11,6 +11,7 @@ systemctl --global disable cloudflared-quick-tunnel-indicator.service 2>/dev/nul
 
 rm -f \
     /usr/local/libexec/cloudflared-quick-tunnel-daemon \
+    /usr/local/libexec/cloudflared_quick_tunnel_gateway.py \
     /usr/local/bin/cloudflared-quick-tunnelctl \
     /usr/local/bin/cloudflared-quick-tunnel-indicator \
     /etc/systemd/system/cloudflared-quick-tunnel.service \

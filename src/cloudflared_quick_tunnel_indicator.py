@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -61,6 +62,9 @@ class TunnelIndicator:
     def __init__(self) -> None:
         Notify.init(APP_ID)
         self.endpoint: str | None = None
+        self.browser_url: str | None = None
+        self.xwayland_display: Gdk.Display | None = None
+        self.copy_pending = False
         self.current_port = 22
         self.busy = False
         self.last_state: str | None = None
@@ -84,9 +88,18 @@ class TunnelIndicator:
         self.copy_item.set_sensitive(False)
         self.menu.append(self.copy_item)
 
+        self.copy_browser_item = Gtk.MenuItem(label="Copy browser terminal link")
+        self.copy_browser_item.connect("activate", self.copy_browser_link)
+        self.copy_browser_item.set_sensitive(False)
+        self.menu.append(self.copy_browser_item)
+
         self.ssh_item = Gtk.MenuItem(label="Start / cycle SSH tunnel (port 22)")
         self.ssh_item.connect("activate", self.start_ssh)
         self.menu.append(self.ssh_item)
+
+        self.browser_item = Gtk.MenuItem(label="Start / cycle browser terminal")
+        self.browser_item.connect("activate", self.start_browser)
+        self.menu.append(self.browser_item)
 
         self.custom_item = Gtk.MenuItem(label="Forward custom TCP port…")
         self.custom_item.connect("activate", self.choose_custom_port)
@@ -129,10 +142,12 @@ class TunnelIndicator:
         self.status_item.set_label(message)
         self.indicator.set_icon_full("network-transmit-receive-symbolic", message)
         self.ssh_item.set_sensitive(False)
+        self.browser_item.set_sensitive(False)
         self.custom_item.set_sensitive(False)
         self.stop_item.set_sensitive(False)
         self.refresh_item.set_sensitive(False)
         self.copy_item.set_sensitive(False)
+        self.copy_browser_item.set_sensitive(False)
 
     def run_request(
         self,
@@ -179,6 +194,13 @@ class TunnelIndicator:
         self.run_request(
             {"action": "cycle", "port": 22},
             "Creating a new SSH tunnel…",
+            self.tunnel_started,
+        )
+
+    def start_browser(self, _item: Gtk.MenuItem) -> None:
+        self.run_request(
+            {"action": "cycle", "mode": "browser-tty"},
+            "Creating a new browser terminal tunnel…",
             self.tunnel_started,
         )
 
@@ -245,27 +267,83 @@ class TunnelIndicator:
     def tunnel_started(self, response: dict[str, Any]) -> None:
         endpoint = response.get("endpoint")
         port = response.get("port")
-        if endpoint:
+        if response.get("browser_url"):
+            self.notify("Browser terminal ready", "Use Copy browser terminal link from the tray menu.")
+        elif endpoint:
             self.notify(
                 "Quick Tunnel ready",
                 f"{endpoint} forwards to localhost:{port}. Use Copy endpoint from the tray menu.",
             )
 
     def copy_endpoint(self, _item: Gtk.MenuItem) -> None:
-        if not self.endpoint:
+        if self.endpoint:
+            self.copy_text(self.endpoint, "Endpoint copied", self.endpoint)
+
+    def copy_browser_link(self, _item: Gtk.MenuItem) -> None:
+        if self.browser_url:
+            self.copy_text(self.browser_url, "Browser terminal link copied", "Paste the link into the browser terminal page.")
+
+    def copy_text(self, text: str, title: str, message: str) -> None:
+        if self.copy_pending:
             return
-        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clipboard.set_text(self.endpoint, -1)
+        display = Gdk.Display.get_default()
+        if display.__gtype__.name == "GdkWaylandDisplay":
+            # The tray's D-Bus activation does not give GTK Wayland keyboard focus.
+            self.copy_with_wayland(text, title, message)
+            return
+        self.copy_with_gtk(display, text, title, message)
+
+    def copy_with_gtk(self, display: Gdk.Display, text: str, title: str, message: str) -> None:
+        clipboard = Gtk.Clipboard.get_for_display(display, Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(text, -1)
         clipboard.store()
-        self.notify("Endpoint copied", self.endpoint, "edit-copy-symbolic")
+        self.notify(title, message, "edit-copy-symbolic")
+
+    def copy_with_wayland(self, text: str, title: str, message: str) -> None:
+        self.copy_pending = True
+
+        def complete(error: str | None) -> bool:
+            self.copy_pending = False
+            if error is None:
+                self.notify(title, message, "edit-copy-symbolic")
+                return False
+
+            # Some compositors, including GNOME, bridge the XWayland clipboard.
+            x11_display_name = os.environ.get("DISPLAY")
+            if x11_display_name and self.xwayland_display is None:
+                self.xwayland_display = Gdk.Display.open(x11_display_name)
+            if self.xwayland_display is None:
+                self.notify("Could not copy to clipboard", error, "dialog-error-symbolic")
+            else:
+                self.copy_with_gtk(self.xwayland_display, text, title, message)
+            return False
+
+        def worker() -> None:
+            error = None
+            try:
+                subprocess.run(
+                    ["wl-copy", "--type", "text/plain"],
+                    input=text.encode("utf-8"),
+                    check=True,
+                    timeout=5,
+                )
+            except FileNotFoundError:
+                error = "Install wl-clipboard to copy links in this Wayland session."
+            except (OSError, subprocess.SubprocessError):
+                error = "The Wayland clipboard did not accept the text."
+            GLib.idle_add(complete, error)
+
+        threading.Thread(target=worker, name="copy-endpoint", daemon=True).start()
 
     def apply_status(self, response: dict[str, Any]) -> None:
         state = response.get("state", "unknown")
         endpoint = response.get("endpoint")
         port = response.get("port")
+        browser_mode = response.get("mode") == "browser-tty"
         if isinstance(port, int):
             self.current_port = port
         self.endpoint = endpoint
+        self.browser_url = response.get("browser_url")
         self.last_state = state
 
         ready = state == "ready" and bool(endpoint)
@@ -273,10 +351,12 @@ class TunnelIndicator:
             display_endpoint = endpoint
             if len(display_endpoint) > 54:
                 display_endpoint = display_endpoint[:51] + "…"
-            self.status_item.set_label(f"{display_endpoint}  →  localhost:{port}")
+            target = "Browser terminal" if browser_mode else f"localhost:{port}"
+            self.status_item.set_label(f"{display_endpoint}  →  {target}")
             self.indicator.set_icon_full("network-vpn-symbolic", "Quick Tunnel ready")
         elif state == "starting":
-            self.status_item.set_label(f"Starting tunnel to localhost:{port}…")
+            message = "Starting browser terminal…" if browser_mode else f"Starting tunnel to localhost:{port}…"
+            self.status_item.set_label(message)
             self.indicator.set_icon_full("network-transmit-receive-symbolic", "Quick Tunnel starting")
         elif state == "error":
             self.status_item.set_label(response.get("last_error") or "Tunnel error")
@@ -286,19 +366,24 @@ class TunnelIndicator:
             self.indicator.set_icon_full("network-offline-symbolic", "Quick Tunnel stopped")
 
         self.copy_item.set_sensitive(ready)
+        self.copy_browser_item.set_sensitive(ready and bool(self.browser_url))
         self.stop_item.set_sensitive(state in {"ready", "starting", "error"})
         self.ssh_item.set_sensitive(True)
+        self.browser_item.set_sensitive(True)
         self.custom_item.set_sensitive(True)
         self.refresh_item.set_sensitive(True)
 
     def apply_error(self, error: str) -> None:
         self.endpoint = None
+        self.browser_url = None
         self.last_state = "unavailable"
         self.status_item.set_label(error)
         self.indicator.set_icon_full("dialog-error-symbolic", "Quick Tunnel unavailable")
         self.copy_item.set_sensitive(False)
+        self.copy_browser_item.set_sensitive(False)
         self.stop_item.set_sensitive(False)
         self.ssh_item.set_sensitive(True)
+        self.browser_item.set_sensitive(True)
         self.custom_item.set_sensitive(True)
         self.refresh_item.set_sensitive(True)
         self.notify("Quick Tunnel error", error, "dialog-error-symbolic")

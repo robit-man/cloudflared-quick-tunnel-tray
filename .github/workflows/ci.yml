@@ -20,17 +20,19 @@ jobs:
             desktop-file-utils \
             gir1.2-ayatanaappindicator3-0.1 \
             gir1.2-notify-0.7 \
+            openssh-client \
             python3-gi \
+            python3-websockets \
             shellcheck
 
       - name: Run unit tests
-        run: python3 -m unittest discover -s tests -v
+        run: /usr/bin/python3 -m unittest discover -s tests -v
 
       - name: Validate Python syntax
         run: python3 -m py_compile src/*.py
 
       - name: Validate shell scripts
-        run: shellcheck install.sh uninstall.sh
+        run: shellcheck setup.sh install.sh uninstall.sh
 
       - name: Validate desktop entry
         run: desktop-file-validate xdg/cloudflared-quick-tunnel-indicator.desktop
