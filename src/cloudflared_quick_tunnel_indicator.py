@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,9 @@ from gi.repository import Gdk, GLib, Gtk, Notify  # noqa: E402
 
 SOCKET_PATH = Path("/run/cloudflared-quick-tunnel/control.sock")
 APP_ID = "cloudflared-quick-tunnel-indicator"
+UPDATE_HELPER = "/usr/local/libexec/cloudflared-quick-tunnel-update"
+UPDATE_UNIT = "cloudflared-quick-tunnel-update.service"
+SYSTEMCTL = "/usr/bin/systemctl"
 
 
 def service_request(payload: dict[str, Any], timeout: float = 50.0) -> dict[str, Any]:
@@ -60,6 +64,54 @@ def service_request(payload: dict[str, Any], timeout: float = 50.0) -> dict[str,
     return response
 
 
+def check_update() -> str | None:
+    result = subprocess.run(
+        ["/usr/bin/python3", "-I", UPDATE_HELPER, "--check"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if result.returncode:
+        raise RuntimeError("Couldn’t check GitHub for an update. Try again later.")
+    revisions = json.loads(result.stdout)
+    return revisions["latest"] if revisions["latest"] != revisions["installed"] else None
+
+
+def apply_update() -> None:
+    # Use noninteractive sudo only when the administrator has already authorized it.
+    command = [SYSTEMCTL, "start", "--no-block", UPDATE_UNIT]
+    sudo = "/usr/bin/sudo"
+    scheduled = os.access(sudo, os.X_OK) and subprocess.run(
+        [sudo, "-n", *command], capture_output=True, timeout=10,
+    ).returncode == 0
+    if not scheduled:
+        pkexec = "/usr/bin/pkexec"
+        if not os.access(pkexec, os.X_OK):
+            raise RuntimeError(f"Administrator authorization is needed. Run sudo systemctl start {UPDATE_UNIT}.")
+        authorized = subprocess.run(
+            [pkexec, "--disable-internal-agent", *command], capture_output=True, timeout=120,
+        ).returncode
+        if authorized == 126:
+            raise RuntimeError("The update was cancelled.")
+        if authorized:
+            raise RuntimeError(f"Couldn’t authorize the update. Run sudo systemctl start {UPDATE_UNIT}.")
+
+    # The system manager owns the job and keeps running when the tray is replaced.
+    deadline = time.monotonic() + 195
+    while time.monotonic() < deadline:
+        status = subprocess.run(
+            [SYSTEMCTL, "show", "--property=ActiveState,Result,Job", UPDATE_UNIT],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        properties = dict(line.split("=", 1) for line in status.stdout.splitlines() if "=" in line)
+        active = properties.get("ActiveState") in {"activating", "active", "deactivating"}
+        if active or properties.get("Job", "") not in {"", "0"}:
+            time.sleep(1)
+            continue
+        if properties.get("Result") == "success":
+            return
+        raise RuntimeError(f"The update failed. Details: journalctl -u {UPDATE_UNIT}")
+    raise RuntimeError(f"The update did not finish in time. Check systemctl status {UPDATE_UNIT}.")
+
+
 class TunnelIndicator:
     def __init__(self) -> None:
         Notify.init(APP_ID)
@@ -72,6 +124,10 @@ class TunnelIndicator:
         self.last_state: str | None = None
         self.browser_sessions: list[dict[str, Any]] | None = None
         self.pending_session_end: str | None = None
+        self.tunnel_icon = ("network-offline-symbolic", "Quick Tunnel stopped")
+        self.available_revision: str | None = None
+        self.checking_update = False
+        self.installing_update = False
 
         self.indicator = AppIndicator.Indicator.new(
             APP_ID,
@@ -123,6 +179,10 @@ class TunnelIndicator:
         self.menu.append(self.refresh_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
+        self.update_item = Gtk.MenuItem(label="Check for updates")
+        self.update_item.connect("activate", self.select_update)
+        self.menu.append(self.update_item)
+
         self.quit_item = Gtk.MenuItem(label="Quit indicator")
         self.quit_item.connect("activate", lambda _item: Gtk.main_quit())
         self.menu.append(self.quit_item)
@@ -130,7 +190,9 @@ class TunnelIndicator:
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
         self.refresh()
+        self.check_for_updates()
         GLib.timeout_add_seconds(4, self.periodic_refresh)
+        GLib.timeout_add_seconds(30 * 60, self.check_for_updates)
 
     def periodic_refresh(self) -> bool:
         if not self.busy:
@@ -145,10 +207,90 @@ class TunnelIndicator:
         except GLib.Error:
             pass
 
+    def set_tunnel_icon(self, icon: str, tooltip: str) -> None:
+        self.tunnel_icon = (icon, tooltip)
+        self.refresh_icon()
+
+    def refresh_icon(self) -> None:
+        if self.installing_update:
+            self.indicator.set_icon_full("system-software-install-symbolic", "Installing Quick Tunnel update")
+        elif self.available_revision:
+            self.indicator.set_icon_full("software-update-available-symbolic", "Quick Tunnel update available")
+        else:
+            self.indicator.set_icon_full(*self.tunnel_icon)
+
+    def update_menu_label(self) -> None:
+        if self.installing_update:
+            label = "Installing update…"
+        elif self.checking_update:
+            label = "Checking for updates…"
+        elif self.available_revision:
+            label = f"Install update ({self.available_revision[:8]})…"
+        else:
+            label = "Check for updates"
+        self.update_item.set_label(label)
+        self.update_item.set_sensitive(not (self.checking_update or self.installing_update))
+        self.refresh_icon()
+
+    def check_for_updates(self, manual: bool = False) -> bool:
+        if self.checking_update or self.installing_update:
+            return True
+        self.checking_update = True
+        self.update_menu_label()
+
+        def worker() -> None:
+            try:
+                revision = check_update()
+                GLib.idle_add(self.update_checked, revision, None, manual)
+            except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                GLib.idle_add(self.update_checked, None, str(exc), manual)
+
+        threading.Thread(target=worker, name="check-update", daemon=True).start()
+        return True
+
+    def update_checked(self, revision: str | None, error: str | None, manual: bool) -> bool:
+        self.checking_update = False
+        if not error:
+            self.available_revision = revision
+        self.update_menu_label()
+        if manual:
+            if error:
+                self.notify("Update check failed", error, "dialog-error-symbolic")
+            elif not revision:
+                self.notify("Quick Tunnel is up to date", "You have the current version.")
+        return False
+
+    def select_update(self, _item: Gtk.MenuItem) -> None:
+        if self.installing_update or self.checking_update:
+            return
+        if not self.available_revision:
+            self.check_for_updates(manual=True)
+            return
+        self.installing_update = True
+        self.update_menu_label()
+
+        def worker() -> None:
+            try:
+                apply_update()
+                GLib.idle_add(self.update_finished, None)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                GLib.idle_add(self.update_finished, str(exc))
+
+        threading.Thread(target=worker, name="install-update", daemon=True).start()
+
+    def update_finished(self, error: str | None) -> bool:
+        self.installing_update = False
+        if not error:
+            self.available_revision = None
+        self.update_menu_label()
+        if error:
+            self.notify("Quick Tunnel update", error, "dialog-error-symbolic")
+        return False
+
     def set_busy(self, message: str) -> None:
         self.busy = True
         self.status_item.set_label(message)
-        self.indicator.set_icon_full("network-transmit-receive-symbolic", message)
+        self.set_tunnel_icon("network-transmit-receive-symbolic", message)
         self.ssh_item.set_sensitive(False)
         self.browser_item.set_sensitive(False)
         self.custom_item.set_sensitive(False)
@@ -405,17 +547,17 @@ class TunnelIndicator:
                 display_endpoint = display_endpoint[:51] + "…"
             target = "Browser terminal" if browser_mode else f"localhost:{port}"
             self.status_item.set_label(f"{display_endpoint}  →  {target}")
-            self.indicator.set_icon_full("network-vpn-symbolic", "Quick Tunnel ready")
+            self.set_tunnel_icon("network-vpn-symbolic", "Quick Tunnel ready")
         elif state == "starting":
             message = "Starting browser terminal…" if browser_mode else f"Starting tunnel to localhost:{port}…"
             self.status_item.set_label(message)
-            self.indicator.set_icon_full("network-transmit-receive-symbolic", "Quick Tunnel starting")
+            self.set_tunnel_icon("network-transmit-receive-symbolic", "Quick Tunnel starting")
         elif state == "error":
             self.status_item.set_label(response.get("last_error") or "Tunnel error")
-            self.indicator.set_icon_full("dialog-error-symbolic", "Quick Tunnel error")
+            self.set_tunnel_icon("dialog-error-symbolic", "Quick Tunnel error")
         else:
             self.status_item.set_label("No tunnel for this user")
-            self.indicator.set_icon_full("network-offline-symbolic", "Quick Tunnel stopped")
+            self.set_tunnel_icon("network-offline-symbolic", "Quick Tunnel stopped")
 
         self.copy_item.set_sensitive(ready)
         self.copy_browser_item.set_sensitive(ready and bool(self.browser_url))
@@ -431,7 +573,7 @@ class TunnelIndicator:
         self.browser_url = None
         self.last_state = "unavailable"
         self.status_item.set_label(error)
-        self.indicator.set_icon_full("dialog-error-symbolic", "Quick Tunnel unavailable")
+        self.set_tunnel_icon("dialog-error-symbolic", "Quick Tunnel unavailable")
         self.copy_item.set_sensitive(False)
         self.copy_browser_item.set_sensitive(False)
         self.update_browser_sessions([], False)

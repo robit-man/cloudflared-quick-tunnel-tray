@@ -15,8 +15,11 @@ as_root() {
 }
 
 download() {
+    url=$1
+    destination=$2
+    shift 2
     curl -q --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 15 \
-        --fail --silent --show-error --location --output "$2" "$1"
+        --max-time 90 --fail --silent --show-error --location --output "$destination" "$@" "$url"
 }
 
 install_dependencies() {
@@ -24,15 +27,15 @@ install_dependencies() {
         as_root apt-get update
         as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
-            gir1.2-notify-0.7 openssh-client python3-websockets util-linux wl-clipboard
+            gir1.2-notify-0.7 openssh-client python3-websockets util-linux wl-clipboard pkexec
     elif command -v dnf >/dev/null 2>&1; then
         as_root dnf install -y \
             python3 python3-gobject python3-websockets gtk3 libayatana-appindicator-gtk3 \
-            libnotify openssh-clients util-linux wl-clipboard
+            libnotify openssh-clients util-linux wl-clipboard polkit
     elif command -v pacman >/dev/null 2>&1; then
         as_root pacman -S --needed --noconfirm \
             python python-gobject python-websockets gtk3 libayatana-appindicator \
-            libnotify openssh util-linux wl-clipboard
+            libnotify openssh util-linux wl-clipboard polkit
     else
         echo "Checking existing dependencies on this distribution."
     fi
@@ -83,11 +86,19 @@ main() {
     fi
     if [ -z "$project_dir" ] || [ ! -f "$project_dir/install.sh" ] || [ ! -d "$project_dir/src" ]; then
         echo "Downloading Cloudflare Quick Tunnel Tray."
-        download 'https://codeload.github.com/robit-man/cloudflared-quick-tunnel-tray/tar.gz/refs/heads/main' \
+        download 'https://api.github.com/repos/robit-man/cloudflared-quick-tunnel-tray/commits/main' \
+            "$work_dir/revision" --header 'Accept: application/vnd.github.sha' --header 'Cache-Control: no-cache'
+        revision=$(cat "$work_dir/revision")
+        case "$revision" in
+            *[!0-9a-f]*) fail "GitHub returned an invalid commit ID." ;;
+        esac
+        [ "${#revision}" -eq 40 ] || fail "GitHub returned an invalid commit ID."
+        download "https://codeload.github.com/robit-man/cloudflared-quick-tunnel-tray/tar.gz/$revision" \
             "$work_dir/source.tar.gz"
         project_dir="$work_dir/source"
         mkdir "$project_dir"
         tar -xzf "$work_dir/source.tar.gz" -C "$project_dir" --strip-components=1
+        printf '%s\n' "$revision" > "$project_dir/REVISION"
     fi
     [ -f "$project_dir/install.sh" ] || fail "The project archive is missing install.sh."
 

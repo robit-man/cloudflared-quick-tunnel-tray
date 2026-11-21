@@ -63,6 +63,22 @@ start your tray immediately. The installer stops existing tray instances and
 the broker before replacing their files, then starts the updated services.
 Upgrading ends active tunnels and browser sessions.
 
+## Update from the tray
+
+The tray checks this repository’s GitHub `main` branch at startup and every 30
+minutes. It shows an update icon when the GitHub commit differs from the
+installed revision. Open the tray and select **Install update**. The desktop
+may request administrator authorization through Polkit. The system update
+service downloads the exact GitHub commit, runs the installer, and restarts
+the broker and tray.
+
+Select **Check for updates** for an immediate check. Installations from before
+this feature need one upgrade using the setup command above. If your desktop
+has no Polkit authentication agent, you can run
+`sudo systemctl start cloudflared-quick-tunnel-update.service` after that
+upgrade. See update errors with
+`sudo journalctl -u cloudflared-quick-tunnel-update.service`.
+
 ## Tray actions
 
 - **Copy endpoint** — copies only the generated hostname.

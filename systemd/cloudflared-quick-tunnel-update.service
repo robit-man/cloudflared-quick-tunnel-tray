@@ -1,0 +1,9 @@
+[Unit]
+Description=Update Cloudflare Quick Tunnel Tray from GitHub
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/cloudflared-quick-tunnel-update --install
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+TimeoutStartSec=3min
+TimeoutStopSec=45s

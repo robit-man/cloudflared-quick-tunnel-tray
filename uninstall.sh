@@ -6,15 +6,19 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+systemctl stop cloudflared-quick-tunnel-update.service 2>/dev/null || true
 systemctl disable --now cloudflared-quick-tunnel.service 2>/dev/null || true
 systemctl --global disable cloudflared-quick-tunnel-indicator.service 2>/dev/null || true
 
 rm -f \
     /usr/local/libexec/cloudflared-quick-tunnel-daemon \
     /usr/local/libexec/cloudflared_quick_tunnel_gateway.py \
+    /usr/local/libexec/cloudflared-quick-tunnel-update \
+    /usr/local/share/cloudflared-quick-tunnel/revision \
     /usr/local/bin/cloudflared-quick-tunnelctl \
     /usr/local/bin/cloudflared-quick-tunnel-indicator \
     /etc/systemd/system/cloudflared-quick-tunnel.service \
+    /etc/systemd/system/cloudflared-quick-tunnel-update.service \
     /etc/systemd/user/cloudflared-quick-tunnel-indicator.service \
     /usr/share/applications/cloudflared-quick-tunnel-indicator.desktop
 

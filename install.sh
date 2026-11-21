@@ -41,7 +41,7 @@ try:
 except (ImportError, ValueError) as exc:
     sys.exit(f"Could not load GTK or AppIndicator bindings ({exc}). Run ./setup.sh to install dependencies.")
 
-for component in ("daemon", "gateway", "ctl", "indicator"):
+for component in ("daemon", "gateway", "ctl", "indicator", "update"):
     path = Path(sys.argv[1], "src", f"cloudflared_quick_tunnel_{component}.py")
     compile(path.read_bytes(), str(path), "exec")
 PY
@@ -165,18 +165,39 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+revision=
+if [ -f "$project_dir/REVISION" ]; then
+    revision=$(cat "$project_dir/REVISION")
+elif [ -e "$project_dir/.git" ] && command -v git >/dev/null 2>&1; then
+    revision=$(git -C "$project_dir" rev-parse --verify HEAD 2>/dev/null || :)
+fi
+case "$revision" in
+    *[!0-9a-f]*) revision= ;;
+esac
+if [ "${#revision}" -ne 40 ]; then
+    revision=unknown
+fi
+printf '%s\n' "$revision" > "$stage/revision"
+
 cat > "$manifest" <<'FILES'
 0755 src/cloudflared_quick_tunnel_daemon.py /usr/local/libexec/cloudflared-quick-tunnel-daemon
 0644 src/cloudflared_quick_tunnel_gateway.py /usr/local/libexec/cloudflared_quick_tunnel_gateway.py
+0755 src/cloudflared_quick_tunnel_update.py /usr/local/libexec/cloudflared-quick-tunnel-update
+0644 revision /usr/local/share/cloudflared-quick-tunnel/revision
 0755 src/cloudflared_quick_tunnel_ctl.py /usr/local/bin/cloudflared-quick-tunnelctl
 0755 src/cloudflared_quick_tunnel_indicator.py /usr/local/bin/cloudflared-quick-tunnel-indicator
 0644 systemd/cloudflared-quick-tunnel.service /etc/systemd/system/cloudflared-quick-tunnel.service
+0644 systemd/cloudflared-quick-tunnel-update.service /etc/systemd/system/cloudflared-quick-tunnel-update.service
 0644 systemd/cloudflared-quick-tunnel-indicator.service /etc/systemd/user/cloudflared-quick-tunnel-indicator.service
 0644 xdg/cloudflared-quick-tunnel-indicator.desktop /usr/share/applications/cloudflared-quick-tunnel-indicator.desktop
 FILES
 
 while read -r mode source destination; do
-    install -D -o root -g root -m "$mode" "$project_dir/$source" "$stage/new$destination"
+    source_path=$project_dir/$source
+    if [ "$source" = revision ]; then
+        source_path=$stage/revision
+    fi
+    install -D -o root -g root -m "$mode" "$source_path" "$stage/new$destination"
     if [ -e "$destination" ] || [ -L "$destination" ]; then
         mkdir -p "$(dirname "$stage/old$destination")"
         cp -a -- "$destination" "$stage/old$destination"
