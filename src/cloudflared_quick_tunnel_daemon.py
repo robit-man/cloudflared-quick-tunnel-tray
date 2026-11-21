@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SOCKET_PATH = Path("/run/cloudflared-quick-tunnel/control.sock")
 EXECUTABLE_PATH = "/usr/local/bin:/usr/bin:/bin"
 CLOUDFLARED = shutil.which("cloudflared", path=EXECUTABLE_PATH) or "/usr/local/bin/cloudflared"
@@ -38,6 +38,7 @@ GATEWAY = Path(__file__).with_name("cloudflared_quick_tunnel_gateway.py")
 NATIVE_MODE = "native"
 BROWSER_MODE = "browser-tty"
 ENDPOINT_RE = re.compile(r"https://([a-z0-9-]+\.trycloudflare\.com)\b", re.I)
+SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 MAX_REQUEST = 16 * 1024
 START_TIMEOUT = 40.0
@@ -89,6 +90,7 @@ class TunnelSession:
     mode: str = NATIVE_MODE
     process: subprocess.Popen[str] | None = None
     gateway: subprocess.Popen[bytes] | None = None
+    gateway_control: socket.socket | None = field(default=None, repr=False)
     token: str | None = field(default=None, repr=False)
     state: str = "stopped"
     endpoint: str | None = None
@@ -109,7 +111,9 @@ class TunnelSession:
             self._notice_exit_locked()
             return self._status_locked()
 
-    def _status_locked(self) -> dict[str, Any]:
+    def _status_locked(self, browser_sessions: list[dict] | None = None) -> dict[str, Any]:
+        if browser_sessions is None and self.state == "ready" and self.gateway_control is not None:
+            browser_sessions = self._browser_control_locked({"action": "list"})["sessions"]
         pid = self.process.pid if self.process and self.process.poll() is None else None
         return {
             "version": VERSION,
@@ -124,6 +128,7 @@ class TunnelSession:
                 f"https://{self.endpoint}/#tty={self.token}"
                 if self.state == "ready" and self.endpoint and self.token else None
             ),
+            "browser_sessions": browser_sessions or [],
             "pid": pid,
             "started_at": self.started_at,
             "last_error": self.last_error,
@@ -142,7 +147,10 @@ class TunnelSession:
                 and self.mode == mode
                 and self.state == "ready"
             ):
-                return self._status_locked()
+                status = self._status_locked()
+                if self.state == "ready":
+                    return status
+                raise RequestError(self.last_error or "Quick Tunnel session control is unavailable")
 
             if mode == BROWSER_MODE:
                 if self.uid == 0:
@@ -228,7 +236,9 @@ class TunnelSession:
                 self._notice_exit_locked()
 
             if self.process is process and self.state == "ready":
-                return self._status_locked()
+                status = self._status_locked()
+                if self.state == "ready":
+                    return status
 
             if self.process is process and self.state == "starting":
                 self._fail_locked("Timed out waiting for the Quick Tunnel to register")
@@ -237,15 +247,18 @@ class TunnelSession:
     def _start_gateway_locked(self, drop_privileges: list[str], environment: dict[str, str]) -> int:
         token = secrets.token_urlsafe(32)
         try:
-            gateway = subprocess.Popen(
-                [*drop_privileges, "/usr/bin/python3", "-I", str(GATEWAY)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                env=environment,
-                start_new_session=True,
-            )
+            self.gateway_control, child_control = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.gateway_control.settimeout(5)
+            with child_control:
+                gateway = subprocess.Popen(
+                    [*drop_privileges, "/usr/bin/python3", "-I", str(GATEWAY), str(child_control.fileno())],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    pass_fds=(child_control.fileno(),),
+                    env=environment,
+                    start_new_session=True,
+                )
             self.gateway = gateway
             assert gateway.stdin is not None and gateway.stdout is not None
             with gateway.stdin as token_pipe, gateway.stdout as ready_pipe:
@@ -279,6 +292,26 @@ class TunnelSession:
             self._stop_locked()
             return self._status_locked()
 
+    def end_browser_session(self, session_id: str) -> dict[str, Any]:
+        with self.changed:
+            self._notice_exit_locked()
+            if self.state != "ready" or self.gateway_control is None:
+                return {**self._status_locked(), "session_ended": False}
+            reply = self._browser_control_locked({"action": "end", "id": session_id})
+            return {**self._status_locked(reply["sessions"]), "session_ended": reply["ended"]}
+
+    def _browser_control_locked(self, request: dict[str, str]) -> dict[str, Any]:
+        assert self.gateway_control is not None
+        try:
+            self.gateway_control.sendall(json.dumps(request).encode("utf-8"))
+            reply = json.loads(self.gateway_control.recv(MAX_REQUEST))
+            if isinstance(reply, dict) and isinstance(reply.get("sessions"), list) and type(reply.get("ended")) is bool:
+                return reply
+        except (OSError, ValueError):
+            pass
+        self._fail_locked("Lost session control for the browser terminal gateway")
+        return {"sessions": [], "ended": False}
+
     def _stop_locked(self) -> None:
         if self.process:
             LOG.info("stopping tunnel uid=%s pid=%s", self.uid, self.process.pid)
@@ -291,6 +324,9 @@ class TunnelSession:
     def _clear_processes_locked(self) -> None:
         # Clear ownership before waiting so stale watchers cannot update the next tunnel.
         gateway, process = self.gateway, self.process
+        if self.gateway_control is not None:
+            self.gateway_control.close()
+        self.gateway_control = None
         self.gateway = None
         self.process = None
         self.token = None
@@ -416,6 +452,11 @@ def handle_request(uid: int, gid: int, request: dict[str, Any]) -> dict[str, Any
     session = MANAGER.session_for_peer(uid, gid)
     if action == "status":
         return {"ok": True, **session.status()}
+    if action == "end-session":
+        session_id = request.get("id")
+        if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+            raise RequestError("Invalid browser session ID")
+        return {"ok": True, **session.end_browser_session(session_id)}
     if action in ("start", "cycle"):
         with session.lock:
             keep_current = action == "cycle" and "mode" not in request and "port" not in request
@@ -429,7 +470,7 @@ def handle_request(uid: int, gid: int, request: dict[str, Any]) -> dict[str, Any
             return {"ok": True, **session.start(port, force=action == "cycle", mode=mode)}
     if action == "stop":
         return {"ok": True, **session.stop()}
-    raise RequestError("Unknown action; use status, start, cycle, stop, or ping")
+    raise RequestError("Unknown action; use status, start, cycle, stop, end-session, or ping")
 
 
 def peer_credentials(connection: socket.socket) -> tuple[int, int, int]:

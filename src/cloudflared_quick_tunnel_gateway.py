@@ -8,17 +8,21 @@ import base64
 import ctypes
 import errno
 import fcntl
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
 import signal
+import socket
 import stat
 import struct
 import sys
 import tempfile
 import termios
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 
@@ -30,6 +34,7 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")
 HELLO_TIMEOUT = 5
 MAX_CONTROL_SIZE = 4096
+MAX_BROKER_MESSAGE = 16 * 1024
 MAX_SESSIONS = 16
 MAX_KEY_SIZE = 64 * 1024
 SSH = "/usr/bin/ssh"
@@ -49,6 +54,40 @@ class TerminalProtocol(WebSocketServerProtocol):
     async def handshake(self, *args, **kwargs):
         # websockets 10 does not yet have the open_timeout option.
         return await asyncio.wait_for(super().handshake(*args, **kwargs), HELLO_TIMEOUT)
+
+
+@dataclass
+class BrowserSession:
+    websocket: TerminalProtocol
+    user: str
+    connected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def status(self, session_id: str) -> dict:
+        forwarded = self.websocket.request_headers.get_all("CF-Connecting-IP")
+        client_ip = None
+        if len(forwarded) == 1 and len(forwarded[0]) <= 45 and "%" not in forwarded[0]:
+            try:
+                client_ip = str(ipaddress.ip_address(forwarded[0]))
+            except ValueError:
+                pass
+        return {"id": session_id, "user": self.user, "connected_at": self.connected_at, "client_ip": client_ip}
+
+
+async def serve_broker(control: socket.socket, sessions: dict[str, BrowserSession]) -> None:
+    control.setblocking(False)
+    loop = asyncio.get_running_loop()
+    while data := await loop.sock_recv(control, MAX_BROKER_MESSAGE):
+        request = json.loads(data)
+        ended = False
+        if request["action"] == "end":
+            session = sessions.get(request["id"])
+            if session:
+                await session.websocket.close(1000, "Ended by tunnel owner")
+                await session.finished.wait()
+                ended = True
+        response = {"sessions": [session.status(key) for key, session in sessions.items()], "ended": ended}
+        await loop.sock_sendall(control, json.dumps(response).encode("utf-8"))
 
 
 def control_message(message: str | bytes) -> dict:
@@ -275,7 +314,7 @@ async def process_request(path, _headers):
     return None
 
 
-async def run_gateway(token: str, directory: Path) -> None:
+async def run_gateway(token: str, directory: Path, control: socket.socket) -> None:
     identity = stage_identity(directory)
     known_hosts = stage_host_keys(directory)
     command = [
@@ -290,23 +329,24 @@ async def run_gateway(token: str, directory: Path) -> None:
         "-o", "ConnectTimeout=10",
         "-o", "ServerAliveInterval=30",
     ]
-    active = 0
+    sessions: dict[str, BrowserSession] = {}
 
     async def handle(websocket: TerminalProtocol) -> None:
-        nonlocal active
         try:
             try:
                 message = await asyncio.wait_for(websocket.recv(), HELLO_TIMEOUT)
             except asyncio.TimeoutError:
                 raise ProtocolError("timeout", "Timed out waiting for terminal hello") from None
             user, cols, rows = authenticate(message, token)
-            if active >= MAX_SESSIONS:
+            if len(sessions) >= MAX_SESSIONS:
                 raise ProtocolError("busy", "Too many terminal sessions", 1013)
-            active += 1
+            session_id = secrets.token_hex(16)
+            session = sessions[session_id] = BrowserSession(websocket, user)
             try:
                 await relay(websocket, [*command, "-l", user, "--", SSH_HOST], cols, rows)
             finally:
-                active -= 1
+                del sessions[session_id]
+                session.finished.set()
         except ConnectionClosed:
             return
         except OSError:
@@ -326,8 +366,16 @@ async def run_gateway(token: str, directory: Path) -> None:
             logger=logger, server_header=None, compression=None, close_timeout=0.5,
             max_size=1024 * 1024, max_queue=4,
         ) as server:
-            print(server.sockets[0].getsockname()[1], flush=True)
-            await stopped.wait()
+            tasks = {asyncio.create_task(serve_broker(control, sessions)), asyncio.create_task(stopped.wait())}
+            try:
+                print(server.sockets[0].getsockname()[1], flush=True)
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(sig)
@@ -348,8 +396,11 @@ def main() -> int:
     if not TOKEN_RE.fullmatch(token):
         return 1
     os.environ["TERM"] = "xterm-256color"
-    with tempfile.TemporaryDirectory(prefix="quick-tunnel-tty-") as private_dir:
-        asyncio.run(run_gateway(token, Path(private_dir)))
+    with socket.socket(fileno=int(sys.argv[1])) as control, tempfile.TemporaryDirectory(
+        prefix="quick-tunnel-tty-"
+    ) as private_dir:
+        control.set_inheritable(False)
+        asyncio.run(run_gateway(token, Path(private_dir), control))
     return 0
 
 

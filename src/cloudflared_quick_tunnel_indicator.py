@@ -6,10 +6,12 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -68,6 +70,8 @@ class TunnelIndicator:
         self.current_port = 22
         self.busy = False
         self.last_state: str | None = None
+        self.browser_sessions: list[dict[str, Any]] | None = None
+        self.pending_session_end: str | None = None
 
         self.indicator = AppIndicator.Indicator.new(
             APP_ID,
@@ -92,6 +96,10 @@ class TunnelIndicator:
         self.copy_browser_item.connect("activate", self.copy_browser_link)
         self.copy_browser_item.set_sensitive(False)
         self.menu.append(self.copy_browser_item)
+
+        self.sessions_item = Gtk.MenuItem(label="Browser sessions (0)")
+        self.sessions_item.set_no_show_all(True)
+        self.menu.append(self.sessions_item)
 
         self.ssh_item = Gtk.MenuItem(label="Start / cycle SSH tunnel (port 22)")
         self.ssh_item.connect("activate", self.start_ssh)
@@ -148,6 +156,7 @@ class TunnelIndicator:
         self.refresh_item.set_sensitive(False)
         self.copy_item.set_sensitive(False)
         self.copy_browser_item.set_sensitive(False)
+        self.sessions_item.set_sensitive(False)
 
     def run_request(
         self,
@@ -179,12 +188,17 @@ class TunnelIndicator:
     ) -> bool:
         self.busy = False
         if error:
+            self.pending_session_end = None
             self.apply_error(error)
             return False
         assert response is not None
         self.apply_status(response)
         if callback:
             callback(response)
+        if self.pending_session_end is not None:
+            session_id = self.pending_session_end
+            self.pending_session_end = None
+            self.end_browser_session(None, session_id)
         return False
 
     def refresh(self) -> None:
@@ -203,6 +217,44 @@ class TunnelIndicator:
             "Creating a new browser terminal tunnel…",
             self.tunnel_started,
         )
+
+    def update_browser_sessions(self, sessions: list[dict[str, Any]], visible: bool) -> None:
+        self.sessions_item.set_visible(visible)
+        self.sessions_item.set_sensitive(visible)
+        if sessions == self.browser_sessions:
+            return
+        self.browser_sessions = sessions
+        self.sessions_item.set_label(f"Browser sessions ({len(sessions)})")
+        menu = Gtk.Menu()
+        if not sessions:
+            empty = Gtk.MenuItem(label="No active browser sessions")
+            empty.set_sensitive(False)
+            menu.append(empty)
+        for session in sessions:
+            session_id = session["id"]
+            connected = datetime.fromisoformat(session["connected_at"]).astimezone().strftime("%H:%M:%S")
+            entry = Gtk.MenuItem(label=f"{session['user']} · {session_id[:8]}")
+            details = Gtk.Menu()
+            labels = [f"Browser attached at {connected}"]
+            if session.get("client_ip"):
+                labels.append(f"Client IP {session['client_ip']}")
+            for label in labels:
+                item = Gtk.MenuItem(label=label)
+                item.set_sensitive(False)
+                details.append(item)
+            end = Gtk.MenuItem(label="End session")
+            end.connect("activate", self.end_browser_session, session_id)
+            details.append(end)
+            entry.set_submenu(details)
+            menu.append(entry)
+        menu.show_all()
+        self.sessions_item.set_submenu(menu)
+
+    def end_browser_session(self, _item: Gtk.MenuItem | None, session_id: str) -> None:
+        if self.busy:
+            self.pending_session_end = session_id
+            return
+        self.run_request({"action": "end-session", "id": session_id}, "Ending browser session…")
 
     def choose_custom_port(self, _item: Gtk.MenuItem) -> None:
         dialog = Gtk.Dialog(
@@ -367,6 +419,7 @@ class TunnelIndicator:
 
         self.copy_item.set_sensitive(ready)
         self.copy_browser_item.set_sensitive(ready and bool(self.browser_url))
+        self.update_browser_sessions(response.get("browser_sessions", []), ready and browser_mode)
         self.stop_item.set_sensitive(state in {"ready", "starting", "error"})
         self.ssh_item.set_sensitive(True)
         self.browser_item.set_sensitive(True)
@@ -381,6 +434,7 @@ class TunnelIndicator:
         self.indicator.set_icon_full("dialog-error-symbolic", "Quick Tunnel unavailable")
         self.copy_item.set_sensitive(False)
         self.copy_browser_item.set_sensitive(False)
+        self.update_browser_sessions([], False)
         self.stop_item.set_sensitive(False)
         self.ssh_item.set_sensitive(True)
         self.browser_item.set_sensitive(True)
@@ -404,6 +458,7 @@ def acquire_single_instance() -> Any:
 def main() -> int:
     instance_lock = acquire_single_instance()
     indicator = TunnelIndicator()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: Gtk.main_quit())
     Gtk.main()
     del indicator
     del instance_lock

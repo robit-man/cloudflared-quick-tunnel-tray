@@ -67,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(action)
         add_json_option(command, suppress_default=True)
 
+    end_session = subparsers.add_parser("end-session", help="end one browser terminal session")
+    end_session.add_argument("session_id")
+    add_json_option(end_session, suppress_default=True)
+
     for action in ("start", "cycle"):
         command = subparsers.add_parser(action)
         target = command.add_mutually_exclusive_group()
@@ -90,6 +94,9 @@ def print_human(response: dict[str, Any], action: str) -> None:
     if action in {"start", "cycle"} and response.get("endpoint"):
         print(response.get("browser_url") or response["endpoint"])
         return
+    if action == "end-session" and response.get("state") != "error":
+        print("Browser session ended" if response["session_ended"] else "Browser session is already closed")
+        return
     state = response.get("state", "unknown")
     if state == "ready":
         target = "browser terminal (local SSH)" if response.get("mode") == "browser-tty" else f"localhost:{response['port']}"
@@ -103,6 +110,8 @@ def print_human(response: dict[str, Any], action: str) -> None:
 def main() -> int:
     args = build_parser().parse_args()
     payload: dict[str, Any] = {"action": args.action}
+    if args.action == "end-session":
+        payload["id"] = args.session_id
     if args.action in {"start", "cycle"}:
         if args.browser:
             payload["mode"] = "browser-tty"

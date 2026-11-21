@@ -59,7 +59,9 @@ cd cloudflared-quick-tunnel-tray
 
 The installer starts the system broker immediately and enables the tray for
 all users' future graphical sessions. Run setup from your desktop session to
-start your tray immediately. Upgrading restarts the broker and ends active tunnels.
+start your tray immediately. The installer stops existing tray instances and
+the broker before replacing their files, then starts the updated services.
+Upgrading ends active tunnels and browser sessions.
 
 ## Tray actions
 
@@ -68,6 +70,8 @@ start your tray immediately. Upgrading restarts the broker and ends active tunne
   a fresh SSH tunnel.
 - **Start / cycle browser terminal** — publishes a new Browser Terminal endpoint.
 - **Copy browser terminal link** — copies the browser link with its per-tunnel token.
+- **Browser sessions** — shows attached browser terminals for your tunnel.
+  Open an entry and choose **End session** to close only that connection.
 - **Forward custom TCP port…** — validates that the local port is listening,
   then creates a TCP Quick Tunnel.
 - **Stop tunnel** — stops only the current Unix user's tunnel.
@@ -90,6 +94,8 @@ cloudflared-quick-tunnelctl stop
 ```
 
 Add `--json` before or after the subcommand for structured output.
+`status --json` includes attached browser terminals in `browser_sessions`.
+Run `cloudflared-quick-tunnelctl end-session SESSION_ID` to close one of them.
 Browser `start` and `cycle` print the pasteable link. `status --json` includes
 it as `browser_url` while the tunnel is ready. A bare `cycle` keeps the current
 mode and port. Use `--port 22` to switch back to native SSH.
@@ -114,6 +120,10 @@ Then point the application at `localhost:9000`.
 2. Choose **Start / cycle browser terminal** in the tray or run `cloudflared-quick-tunnelctl start --browser`.
 3. Choose **Copy browser terminal link**. Paste the full `https://…trycloudflare.com/#tty=…` link into the hosted page, enter your SSH username, and select **Connect**.
 4. Complete the OpenSSH authentication prompt in the terminal. Use **Disconnect** to end the session, or **Stop tunnel** from the tray to close every attached session. Cycling ends all sessions and issues a fresh link.
+
+The tray lists a browser as soon as it passes the tunnel token check. The
+displayed SSH username comes from the browser's login request. The browser
+and its PTY both close when you end that entry.
 
 Password and keyboard-interactive prompts follow the local SSH daemon's
 configuration. To use public-key authentication, generate a dedicated OpenSSH

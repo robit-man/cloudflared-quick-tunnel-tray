@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -30,7 +31,11 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(identity_patch.stop)
         print_patch.start()
         identity_patch.start()
-        self.server_task = asyncio.create_task(gateway.run_gateway(self.token, Path(directory.name)))
+        self.control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.control.setblocking(False)
+        self.addCleanup(self.control.close)
+        self.addCleanup(child.close)
+        self.server_task = asyncio.create_task(gateway.run_gateway(self.token, Path(directory.name), child))
         self.addAsyncCleanup(self.stop_server)
         port = await asyncio.wait_for(listening, timeout=3)
         self.url = f"ws://127.0.0.1:{port}"
@@ -42,6 +47,11 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
     def hello(self, **overrides) -> str:
         hello = {"type": "hello", "v": 1, "user": "ubuntu", "token": self.token, "cols": 120, "rows": 35}
         return json.dumps(hello | overrides)
+
+    async def request(self, action: str, **fields) -> dict:
+        loop = asyncio.get_running_loop()
+        await loop.sock_sendall(self.control, json.dumps({"action": action, **fields}).encode())
+        return json.loads(await asyncio.wait_for(loop.sock_recv(self.control, 16 * 1024), timeout=4))
 
     async def test_wrong_token_and_invalid_parameters_never_start_ssh(self) -> None:
         with patch.object(gateway, "start_ssh") as start_ssh:
@@ -64,6 +74,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                         await websocket.recv()
                     self.assertEqual(closed.exception.code, 1008)
             start_ssh.assert_not_called()
+        self.assertEqual((await self.request("list"))["sessions"], [])
 
     async def test_only_exact_websocket_path_upgrades(self) -> None:
         for path in ("/", "/session", "/ws?query=ignored"):
@@ -107,6 +118,32 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 while len(received) < len(payload):
                     received.extend(await asyncio.wait_for(websocket.recv(), timeout=3))
                 self.assertEqual(received, payload)
+
+    async def test_ending_one_registered_session_keeps_the_other_pty_open(self) -> None:
+        actual_relay = gateway.relay
+
+        async def echo(websocket, _command, cols, rows):
+            await actual_relay(websocket, ["/bin/sh", "-c", "stty raw -echo && printf 'ready' && exec cat"], cols, rows)
+
+        async def open_terminal(websocket, user):
+            await websocket.send(self.hello(user=user))
+            self.assertEqual(json.loads(await websocket.recv()), {"type": "ready", "v": 1})
+            self.assertEqual(await websocket.recv(), b"ready")
+
+        with patch.object(gateway, "relay", side_effect=echo), patch.object(gateway, "SSH", "/bin/sh"):
+            async with connect(self.url + "/ws") as first, connect(self.url + "/ws") as second:
+                await open_terminal(first, "first")
+                await open_terminal(second, "second")
+                registered = (await self.request("list"))["sessions"]
+                self.assertEqual([item["user"] for item in registered], ["first", "second"])
+                first_id = registered[0]["id"]
+                result = await self.request("end", id=first_id)
+                self.assertTrue(result["ended"])
+                self.assertEqual(result["sessions"], registered[1:])
+                self.assertEqual(first.close_code, 1000)
+                self.assertFalse((await self.request("end", id=first_id))["ended"])
+                await second.send(b"still alive")
+                self.assertEqual(await second.recv(), b"still alive")
 
 
 class IdentityTests(unittest.TestCase):

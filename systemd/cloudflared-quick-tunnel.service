@@ -12,7 +12,8 @@ RestartSec=3s
 RuntimeDirectory=cloudflared-quick-tunnel
 RuntimeDirectoryMode=0755
 UMask=0022
-KillMode=control-group
+# Let the broker close the gateway and its PTYs before stopping cloudflared.
+KillMode=mixed
 TimeoutStopSec=15s
 
 # The broker starts tunnel processes as the requesting UID, so it only retains the
