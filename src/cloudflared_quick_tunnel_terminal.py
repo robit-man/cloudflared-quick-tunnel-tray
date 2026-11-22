@@ -158,6 +158,7 @@ class TerminalSession:
         self.secret = secrets.token_urlsafe(32) if resumable else None
         self.connected_at = datetime.now(timezone.utc).isoformat()
         self.client_ip: str | None = None
+        self.control_path = None  # OpenSSH master socket that forks reuse.
         self.buffer = bytearray()
         self.base = 0  # Absolute output offset of buffer[0].
         self.received = 0  # Input bytes written to the PTY.

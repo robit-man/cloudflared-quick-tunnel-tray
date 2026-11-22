@@ -102,15 +102,25 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             received.extend(frame)
         return bytes(received)
 
+    async def test_qtty_session_name_is_validated_before_ssh(self) -> None:
+        commands: list = []
+        with self.fake_ssh("exec cat", commands), patch.object(gateway.os, "access", return_value=True):
+            for name, expected in (("agent-1", "ready"), ("x; rm -rf ~", "error"), ("", "error"), (7, "error")):
+                async with connect(self.url + "/ws") as websocket:
+                    await websocket.send(self.hello(attach=name))
+                    self.assertEqual(json.loads(await websocket.recv())["type"], expected)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][0][-3:], ["/usr/local/bin/qtty", "login", "agent-1"])
+
     async def test_valid_hello_targets_only_loopback_ssh(self) -> None:
         commands: list = []
-        with self.fake_ssh("exec cat", commands):
+        with self.fake_ssh("exec cat", commands), patch.object(gateway.os, "access", return_value=True):
             async with connect(self.url + "/ws", origin="https://static.example") as websocket:
                 await websocket.send(self.hello(host="remote.example"))
                 self.assertEqual(json.loads(await websocket.recv()), {"type": "ready", "v": 1})
         command, cols, rows = commands[0]
         self.assertEqual(command[0], "/usr/bin/ssh")
-        self.assertEqual(command[-4:], ["-l", "ubuntu", "--", "127.0.0.1"])
+        self.assertEqual(command[-6:], ["-l", "ubuntu", "--", "127.0.0.1", "/usr/local/bin/qtty", "login"])
         self.assertIn("IdentityFile=none", command)
         self.assertIn("IdentityAgent=none", command)
         self.assertEqual((cols, rows), (120, 35))
@@ -222,6 +232,33 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             async with connect(self.url + "/ws") as second:
                 await second.send(self.resume(ready, 0))
                 self.assertEqual(json.loads(await second.recv())["code"], "expired")
+
+    async def test_fork_reuses_the_parent_login_and_requires_its_secret(self) -> None:
+        commands: list = []
+        script = "stty raw -echo && exec cat"
+        with self.fake_ssh(script, commands), patch.object(gateway.os, "access", return_value=True):
+            parent, ready = await self.open_resumable(script)
+            self.addAsyncCleanup(parent.close)
+            fork = {"type": "fork", "v": 1, "session": ready["session"], "resume": ready["resume"],
+                    "cols": 90, "rows": 20, "fork": "main"}
+            async with connect(self.url + "/ws") as websocket:
+                await websocket.send(json.dumps(fork | {"resume": secrets.token_urlsafe(32)}))
+                self.assertEqual(json.loads(await websocket.recv())["code"], "expired")
+            async with connect(self.url + "/ws") as websocket:
+                await websocket.send(json.dumps(fork))
+                child = json.loads(await websocket.recv())
+                self.assertEqual(child["type"], "ready")
+                self.assertNotEqual(child["session"], ready["session"])
+                await websocket.send(b"forked")
+                self.assertEqual(await self.read_bytes(websocket, 6), b"forked")
+        (parent_command, *_), (child_command, cols, rows) = commands
+        control = next(item for item in parent_command if item.startswith("ControlPath="))
+        self.assertIn(control, child_command)
+        self.assertIn("ControlMaster=auto", child_command)
+        self.assertEqual(child_command[-6:], ["--", "127.0.0.1", "/usr/local/bin/qtty", "login", "--fork", "main"])
+        self.assertEqual((cols, rows), (90, 20))
+        users = [item["user"] for item in (await self.request("list"))["sessions"]]
+        self.assertEqual(users, ["ubuntu", "ubuntu"])
 
     async def test_resume_rejects_a_wrong_secret(self) -> None:
         script = "stty raw -echo && exec cat"

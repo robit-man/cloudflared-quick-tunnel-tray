@@ -37,6 +37,8 @@ MAX_SESSIONS = 16
 MAX_KEY_SIZE = 64 * 1024
 SSH = "/usr/bin/ssh"
 SSH_HOST = "127.0.0.1"
+QTTY = "/usr/local/bin/qtty"
+QTTY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 
 class TerminalProtocol(WebSocketServerProtocol):
@@ -76,11 +78,29 @@ def authenticate(hello: dict, token: str) -> tuple[str, int, int]:
     return user, *dimensions(hello)
 
 
-def resume_target(request: dict, sessions: dict[str, TerminalSession]) -> tuple[TerminalSession, int]:
-    """Validate a resume request. The per-session secret replaces the tunnel token."""
+def remote_command(request: dict) -> list[str]:
+    """Land browser logins in qtty so their terminals outlive the browser.
+
+    "attach" returns to a named session; "fork" starts a new one in a named
+    session's directory. Names are validated, so they are safe in the remote
+    shell command line.
+    """
+    attach, fork = request.get("attach"), request.get("fork")
+    for name in (attach, fork):
+        if name is not None and (not isinstance(name, str) or not QTTY_NAME_RE.fullmatch(name)):
+            raise ProtocolError("bad_request", "Invalid qtty session name")
+    if not os.access(QTTY, os.X_OK):
+        return []
+    if fork is not None:
+        return [QTTY, "login", "--fork", fork]
+    return [QTTY, "login", attach] if attach is not None else [QTTY, "login"]
+
+
+def owned_session(request: dict, sessions: dict[str, TerminalSession]) -> TerminalSession:
+    """Find the session a resume or fork request proves it owns."""
     if type(request.get("v")) is not int or request["v"] != 1:
-        raise ProtocolError("bad_request", "Expected a version 1 terminal resume")
-    session_id, secret, offset = request.get("session"), request.get("resume"), request.get("offset")
+        raise ProtocolError("bad_request", "Expected a version 1 terminal request")
+    session_id, secret = request.get("session"), request.get("resume")
     session = sessions.get(session_id) if isinstance(session_id, str) else None
     if (
         session is None
@@ -90,6 +110,13 @@ def resume_target(request: dict, sessions: dict[str, TerminalSession]) -> tuple[
         or not secrets.compare_digest(session.secret, secret)
     ):
         raise ProtocolError("expired", "The terminal session is no longer available")
+    return session
+
+
+def resume_target(request: dict, sessions: dict[str, TerminalSession]) -> tuple[TerminalSession, int]:
+    """Validate a resume request. The per-session secret replaces the tunnel token."""
+    session = owned_session(request, sessions)
+    offset = request.get("offset")
     if type(offset) is not int or offset < 0:
         raise ProtocolError("bad_request", "Invalid output offset")
     return session, offset
@@ -175,21 +202,33 @@ async def run_gateway(token: str, directory: Path, control: socket.socket) -> No
     ]
     sessions: dict[str, TerminalSession] = {}
 
-    async def open_session(websocket: TerminalProtocol, hello: dict):
-        user, cols, rows = authenticate(hello, token)
+    def launch(websocket, user, cols, rows, remote, resumable, control):
         if len(sessions) >= MAX_SESSIONS:
             raise ProtocolError("busy", "Too many terminal sessions", 1013)
-        # Older pages omit "resume" and keep the original one-socket lifetime.
-        resumable = hello.get("resume") is True
-        pid, fd = start_ssh([*command, "-l", user, "--", SSH_HOST], cols, rows)
         session_id = secrets.token_hex(16)
+        # The first login becomes an OpenSSH master; forks reuse its
+        # authentication. If the master is gone, ssh simply asks again.
+        control = control or directory / f"cm-{session_id}"
+        multiplex = ["-o", "ControlMaster=auto", "-o", f"ControlPath={control}", "-o", "ControlPersist=60"]
+        pid, fd = start_ssh([*command, *multiplex, "-l", user, "--", SSH_HOST, *remote], cols, rows)
         session = sessions[session_id] = TerminalSession(
             user, pid, fd, resumable, lambda: sessions.pop(session_id, None),
         )
+        session.control_path = control
         ready = {"type": "ready", "v": 1}
         if resumable:
             ready |= {"session": session_id, "resume": session.secret}
         return session, session.claim(websocket, 0), ready
+
+    async def open_session(websocket: TerminalProtocol, hello: dict):
+        user, cols, rows = authenticate(hello, token)
+        # Older pages omit "resume" and keep the original one-socket lifetime.
+        return launch(websocket, user, cols, rows, remote_command(hello), hello.get("resume") is True, None)
+
+    async def fork_session(websocket: TerminalProtocol, request: dict):
+        parent = owned_session(request, sessions)
+        cols, rows = dimensions(request)
+        return launch(websocket, parent.user, cols, rows, remote_command(request), True, parent.control_path)
 
     async def resume_session(websocket: TerminalProtocol, request: dict):
         session, offset = resume_target(request, sessions)
@@ -205,7 +244,7 @@ async def run_gateway(token: str, directory: Path, control: socket.socket) -> No
             except asyncio.TimeoutError:
                 raise ProtocolError("timeout", "Timed out waiting for terminal hello") from None
             request = control_message(message)
-            start = resume_session if request.get("type") == "resume" else open_session
+            start = {"resume": resume_session, "fork": fork_session}.get(request.get("type"), open_session)
             session, attachment, header = await start(websocket, request)
             await session.serve(attachment, header)
         except ConnectionClosed:

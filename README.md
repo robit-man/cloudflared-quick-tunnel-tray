@@ -28,6 +28,7 @@ The browser uses a standalone static page and needs no `cloudflared` installatio
 - A globally enabled systemd user service that starts the tray in graphical
   sessions and stops that user's tunnel when the tray session ends.
 - A CLI for scripting and troubleshooting.
+- `qtty`, which keeps terminal sessions running between browser visits.
 
 The broker drops to the requesting Unix account before starting tunnel
 processes. Browser Terminal mode requires a non-root requester and starts its
@@ -158,6 +159,40 @@ full-screen programs that track the mouse (Claude Code, Codex, `vim`, `less`)
 scroll their own views. Other full-screen programs get arrow keys, and a plain
 shell scrolls the local scrollback.
 
+### Saved sessions with qtty
+
+Browser logins open in `qtty`, so a terminal keeps running after you close
+the tab, lose the network for longer than 15 minutes, or cycle the tunnel.
+Each pane remembers its session. Press Enter in a disconnected pane, sign in,
+and the pane returns to the same session with its screen restored. After a
+reload, the page lists the panes you had open, ready to sign in again. A new
+pane starts a session if you have none and otherwise opens an arrow-key
+picker of running sessions, which also offers a new session and a plain
+shell. Inside a session, Ctrl-] returns to the picker.
+
+The same sessions work over normal SSH:
+
+```bash
+qtty            # picker
+qtty ls         # list (also: qtty --sessions)
+qtty new agent  # start "agent" and attach
+qtty attach agent
+qtty kill agent
+```
+
+Sessions run under your account in a holder process that starts on demand. It
+keeps the latest 1 MiB of each session's output to redraw the screen when you
+attach. Sessions end when their shell exits, or with `qtty kill` or a reboot.
+
+The fork button in a pane header opens a new session beside it, in the same
+working directory. The new pane uses the original pane's SSH login, so it
+needs no password while that login is still open. Otherwise, SSH asks again.
+
+Select text on a touch screen by pressing and holding, then dragging. Lift
+your finger for Copy, Paste and Select all. On a desktop, right-click opens
+the same menu, and Shift-drag (Option-drag on macOS) selects text in programs
+that capture the mouse.
+
 Password and keyboard-interactive prompts follow the local SSH daemon's
 configuration. To use public-key authentication, generate a dedicated OpenSSH
 key with a nonempty passphrase as the Unix user who starts the tunnel.
@@ -186,9 +221,16 @@ link's fragment and travels in the initial WebSocket message. The upgrade URL
 contains only the hostname and `/ws`. After login, the gateway gives the page a
 random secret for that session only. The page keeps it in memory and uses it
 to resume. It never goes in the URL or browser storage, and stops working when
-the session ends or the tunnel cycles. The gateway also requires SSH
-authentication for every terminal session. The static page and Cloudflare are
-in the browser connection's trust path.
+the session ends or the tunnel cycles. Every browser login requires SSH
+authentication. A fork reuses an authenticated login through an OpenSSH
+control socket in the gateway's private directory. The fork request must
+present that pane's session secret. The control connection closes 60 seconds
+after its last terminal. The static page and Cloudflare are in the browser
+connection's trust path.
+
+qtty keeps its socket in `/tmp/qtty-UID`, and refuses to start unless the
+directory is mode 700 and owned by you. The holder also checks each client's
+peer UID.
 
 The control socket is intentionally reachable by local users. The daemon uses
 the kernel-provided peer UID, not a client-supplied username, to choose the
