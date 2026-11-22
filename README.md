@@ -141,6 +141,23 @@ The tray lists a browser as soon as it passes the tunnel token check. The
 displayed SSH username comes from the browser's login request. The browser
 and its PTY both close when you end that entry.
 
+Sessions survive network changes. Moving a phone from Wi-Fi to cellular, or
+waking a laptop, drops the browser's WebSocket without a clean close. The
+gateway keeps the SSH PTY running for up to 15 minutes and buffers its latest
+1 MiB of output. The page sends heartbeats and also checks the connection when
+the browser reports a network or visibility change. When a check fails, it
+opens a new WebSocket and resumes the same PTY. Missed output is replayed from
+the last byte the page received. Keys typed while offline are sent once the
+session resumes, and the gateway's input count stops any byte from being typed
+twice. The tray shows a detached session as waiting to reconnect. **Disconnect**,
+closing the tab, and **End session** still close the PTY immediately.
+
+On touch screens, drag with two fingers to scroll. The page delivers the
+gesture as mouse-wheel input, the same as a desktop wheel or trackpad, so
+full-screen programs that track the mouse (Claude Code, Codex, `vim`, `less`)
+scroll their own views. Other full-screen programs get arrow keys, and a plain
+shell scrolls the local scrollback.
+
 Password and keyboard-interactive prompts follow the local SSH daemon's
 configuration. To use public-key authentication, generate a dedicated OpenSSH
 key with a nonempty passphrase as the Unix user who starts the tunnel.
@@ -166,7 +183,10 @@ database, or development port.
 
 Treat the Browser Terminal link as a secret. The token stays in the pasted
 link's fragment and travels in the initial WebSocket message. The upgrade URL
-contains only the hostname and `/ws`. The gateway also requires SSH
+contains only the hostname and `/ws`. After login, the gateway gives the page a
+random secret for that session only. The page keeps it in memory and uses it
+to resume. It never goes in the URL or browser storage, and stops working when
+the session ends or the tunnel cycles. The gateway also requires SSH
 authentication for every terminal session. The static page and Cloudflare are
 in the browser connection's trust path.
 

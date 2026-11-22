@@ -41,7 +41,7 @@ try:
 except (ImportError, ValueError) as exc:
     sys.exit(f"Could not load GTK or AppIndicator bindings ({exc}). Run ./setup.sh to install dependencies.")
 
-for component in ("daemon", "gateway", "ctl", "indicator", "update"):
+for component in ("daemon", "gateway", "terminal", "ctl", "indicator", "update"):
     path = Path(sys.argv[1], "src", f"cloudflared_quick_tunnel_{component}.py")
     compile(path.read_bytes(), str(path), "exec")
 PY
@@ -182,6 +182,7 @@ printf '%s\n' "$revision" > "$stage/revision"
 cat > "$manifest" <<'FILES'
 0755 src/cloudflared_quick_tunnel_daemon.py /usr/local/libexec/cloudflared-quick-tunnel-daemon
 0644 src/cloudflared_quick_tunnel_gateway.py /usr/local/libexec/cloudflared_quick_tunnel_gateway.py
+0644 src/cloudflared_quick_tunnel_terminal.py /usr/local/libexec/cloudflared_quick_tunnel_terminal.py
 0755 src/cloudflared_quick_tunnel_update.py /usr/local/libexec/cloudflared-quick-tunnel-update
 0644 revision /usr/local/share/cloudflared-quick-tunnel/revision
 0755 src/cloudflared_quick_tunnel_ctl.py /usr/local/bin/cloudflared-quick-tunnelctl

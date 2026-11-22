@@ -127,6 +127,10 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
   const encoder = new TextEncoder();
   let socket = null, sessionReady = false, connecting = false;
   let resizeFrame = 0, connectTimer = 0, term, fit;
+  // Resumable sessions survive a network change (Wi-Fi to cellular, sleep).
+  // The gateway keeps the PTY; this page tracks output offset and unacked input.
+  let resume = null, reconnecting = false, ended = false;
+  const timing = {ping: 5000, answer: 8000, probe: 3000, attempt: 8000, window: 15 * 60 * 1000};
 
   function status(kind, msg) {
     stateDot.dataset.kind = kind;
@@ -168,16 +172,161 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
       throw new Error('Missing browser-terminal token. In the tray, choose Copy browser terminal link (includes #tty=…).');
     return { host, token };
   }
-  function disconnect() {
+  function sendInput(bytes) {
+    if (resume) {
+      resume.pending.push(bytes);
+      resume.pendingBytes += bytes.length;
+      while (resume.pendingBytes > 1048576 && resume.pending.length > 1) {
+        const dropped = resume.pending.shift();
+        resume.pendingBytes -= dropped.length;
+        resume.acked += dropped.length;
+      }
+    }
+    if (sessionReady && !reconnecting && socket?.readyState === WebSocket.OPEN) socket.send(bytes);
+  }
+  function acknowledge(received) {
+    if (!resume || !Number.isSafeInteger(received)) return;
+    while (resume.pending.length && received > resume.acked) {
+      const first = resume.pending[0];
+      const used = Math.min(first.length, received - resume.acked);
+      resume.acked += used;
+      resume.pendingBytes -= used;
+      if (used === first.length) resume.pending.shift();
+      else resume.pending[0] = first.subarray(used);
+    }
+  }
+  function heard() { if (resume) { resume.lastSeen = performance.now(); resume.awaiting = 0; } }
+  function heartbeat() {
+    if (!resume || reconnecting || socket?.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    if (resume.awaiting && now - resume.awaiting > resume.limit) linkLost();
+    else if (!resume.awaiting && now - resume.lastSeen >= timing.ping) {
+      resume.awaiting = now;
+      resume.limit = timing.answer;
+      socket.send(JSON.stringify({type:'ping'}));
+    }
+  }
+  function probe() {
+    if (!resume) return;
+    if (reconnecting) {
+      clearTimeout(resume.retry);
+      resume.attempt = 0;
+      if (!socket) resumeSocket();
+    } else if (socket?.readyState === WebSocket.OPEN && !resume.awaiting) {
+      resume.awaiting = performance.now();
+      resume.limit = timing.probe;
+      socket.send(JSON.stringify({type:'ping'}));
+    }
+  }
+  function dropSocket() {
     const ws = socket;
     socket = null;
-    if (ws) { try { ws.close(1000, 'Client disconnect'); } catch (_) {} }
+    if (!ws) return;
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    try { if (ws.readyState < WebSocket.CLOSING) ws.close(); } catch (_) {}
+  }
+  function linkLost() {
+    dropSocket();
+    if (!reconnecting) {
+      reconnecting = true;
+      resume.since = performance.now();
+      resume.attempt = 0;
+      status('connecting', 'Reconnecting');
+    }
+    scheduleResume();
+  }
+  function scheduleResume() {
+    clearTimeout(resume.retry);
+    if (performance.now() - resume.since > timing.window) {
+      disconnect('The session expired while offline.');
+      return;
+    }
+    const delay = navigator.onLine === false ? 5000 : Math.min(5000, resume.attempt ? 250 * 2 ** resume.attempt : 0);
+    resume.attempt++;
+    resume.retry = setTimeout(resumeSocket, delay);
+  }
+  function writeOutput(bytes) {
+    if (resume) resume.offset += bytes.length;
+    term.write(bytes);
+  }
+  function resumeSocket() {
+    if (!resume || !reconnecting || socket) return;
+    let ws;
+    try { ws = new WebSocket(`wss://${resume.host}/ws`); }
+    catch (_) { scheduleResume(); return; }
+    socket = ws;
+    ws.binaryType = 'arraybuffer';
+    const timer = setTimeout(() => { if (socket === ws) { dropSocket(); scheduleResume(); } }, timing.attempt);
+    ws.onopen = () => {
+      try { fit.fit(); } catch (_) {}
+      ws.send(JSON.stringify({type:'resume', v:1, session:resume.id, resume:resume.secret,
+        offset:resume.offset, cols:term.cols, rows:term.rows}));
+    };
+    ws.onmessage = ({data}) => {
+      if (socket !== ws) return;
+      heard();
+      if (typeof data !== 'string') { if (!reconnecting) writeOutput(new Uint8Array(data)); return; }
+      let msg;
+      try { msg = JSON.parse(data); } catch (_) { return; }
+      if (msg.type === 'resumed' && reconnecting) {
+        clearTimeout(timer);
+        if (Number.isSafeInteger(msg.offset) && msg.offset > resume.offset) {
+          log('Some output was lost while offline.');
+          resume.offset = msg.offset;
+        }
+        acknowledge(msg.in);
+        for (const bytes of resume.pending) ws.send(bytes);
+        reconnecting = false;
+        resume.attempt = 0;
+        status('online', 'Session open');
+      } else if (msg.type === 'error' && reconnecting) {
+        clearTimeout(timer);
+        if (msg.code === 'expired') disconnect('The session expired while offline.');
+        else { dropSocket(); scheduleResume(); }
+      } else {
+        control(ws, msg);
+      }
+    };
+    ws.onclose = event => {
+      if (socket !== ws) return;
+      clearTimeout(timer);
+      if (reconnecting) { socket = null; scheduleResume(); }
+      else closedOnline(event);
+    };
+  }
+  function control(ws, msg) {
+    if (msg.type === 'pong') acknowledge(msg.in);
+    else if (msg.type === 'closed') { ended = true; try { ws.close(); } catch (_) {} }
+  }
+  function closedOnline({code}) {
+    if (resume && !ended && code !== 1000 && code !== 4000) { linkLost(); return; }
+    disconnect(ended ? 'SSH session ended.' : 'Remote session disconnected.');
+  }
+  function stopResume() {
+    if (!resume) return;
+    clearInterval(resume.heartbeat);
+    clearTimeout(resume.retry);
+    resume = null;
+  }
+  addEventListener('online', probe);
+  navigator.connection?.addEventListener?.('change', probe);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') probe(); });
+  function disconnect(message) {
+    const ws = socket;
+    socket = null;
+    if (ws) {
+      if (resume && ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify({type:'bye'})); } catch (_) {} }
+      ws.onclose = null;
+      try { ws.close(1000, 'Client disconnect'); } catch (_) {}
+    }
+    stopResume();
+    reconnecting = false;
     clearTimeout(connectTimer);
     const wasLive = sessionReady;
     connecting = sessionReady = false;
     setControls();
     status('offline', 'Disconnected');
-    if (wasLive) log('Session closed.');
+    if (wasLive) log(typeof message === 'string' ? message : 'Session closed.');
   }
   function initTerminal() {
     if (!Terminal || !FitAddon) {
@@ -209,15 +358,14 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     term.writeln('\x1b[38;5;245mThis page requires the tray\'s browser WebSocket mode.\x1b[0m');
     term.writeln('');
     term.write('\x1b[38;5;109m›\x1b[0m ');
-    term.onData(data => {
-      if (sessionReady && socket?.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
-    });
+    term.onData(data => { if (sessionReady) sendInput(encoder.encode(data)); });
     term.onBinary(data => {
-      if (!sessionReady || socket?.readyState !== WebSocket.OPEN) return;
+      if (!sessionReady) return;
       const bytes = new Uint8Array(data.length);
       for (let i=0;i<data.length;i++) bytes[i] = data.charCodeAt(i) & 255;
-      socket.send(bytes);
+      sendInput(bytes);
     });
+    wireTouchScroll();
     term.attachCustomKeyEventHandler(event => {
       if (event.type !== 'keydown') return true;
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.code === 'KeyC' && term.hasSelection()) {
@@ -236,15 +384,35 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
       resizeFrame = requestAnimationFrame(() => {
         try {
           fit.fit();
-          if (sessionReady && socket?.readyState === WebSocket.OPEN)
+          if (sessionReady && !reconnecting && socket?.readyState === WebSocket.OPEN)
             socket.send(JSON.stringify({type:'resize', cols:term.cols, rows:term.rows}));
         } catch (_) {}
       });
     }).observe(terminalEl.parentElement);
   }
+  // Two-finger drags become wheel events: xterm then sends mouse-wheel reports
+  // to programs that track the mouse (Claude Code, Codex, vim), arrow keys in
+  // an alternate screen, or scrolls local scrollback.
+  function wireTouchScroll() {
+    const element = term.element, screen = element.querySelector('.xterm-screen') || element;
+    let last = null;
+    const mid = t => ({x:(t[0].clientX + t[1].clientX) / 2, y:(t[0].clientY + t[1].clientY) / 2});
+    element.addEventListener('touchstart', e => { last = e.touches.length === 2 ? mid(e.touches) : null; }, {passive:true, capture:true});
+    element.addEventListener('touchmove', e => {
+      if (e.touches.length !== 2 || !last) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const point = mid(e.touches), deltaY = last.y - point.y, deltaX = last.x - point.x;
+      last = point;
+      if (deltaY) screen.dispatchEvent(new WheelEvent('wheel', {deltaX, deltaY, deltaMode:0,
+        clientX:point.x, clientY:point.y, bubbles:true, cancelable:true}));
+    }, {passive:false, capture:true});
+    for (const type of ['touchend', 'touchcancel'])
+      element.addEventListener(type, e => { if (e.touches.length !== 2) last = null; }, {passive:true, capture:true});
+  }
   async function connect() {
     if (!term) return;
-    if (socket) { disconnect(); return; }
+    if (socket || reconnecting) { disconnect(); return; }
     hideToast();
     let dest;
     try { dest = parseEndpoint(endpointEl.value); }
@@ -263,6 +431,7 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     socket = ws;
     ws.binaryType = 'arraybuffer';
     sessionReady = false;
+    ended = false;
     connecting = true;
     setControls();
     status('connecting', 'Connecting');
@@ -276,11 +445,12 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     }, 20000);
     ws.onopen = () => {
       try { fit.fit(); } catch (_) {}
-      ws.send(JSON.stringify({type:'hello', v:1, token:dest.token, user, cols:term.cols, rows:term.rows}));
+      ws.send(JSON.stringify({type:'hello', v:1, token:dest.token, user, cols:term.cols, rows:term.rows, resume:true}));
       term.focus();
     };
     ws.onmessage = async ({data}) => {
       if (ws !== socket) return;
+      heard();
       if (typeof data === 'string') {
         let msg;
         try { msg = JSON.parse(data); } catch (_) {return;}
@@ -290,6 +460,11 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
           sessionReady = true;
           setControls();
           status('online', 'Session open');
+          if (typeof msg.session === 'string' && typeof msg.resume === 'string') {
+            resume = {host:dest.host, id:msg.session, secret:msg.resume, offset:0, pending:[], pendingBytes:0,
+              acked:0, lastSeen:performance.now(), awaiting:0, limit:timing.answer, since:0, attempt:0, retry:0,
+              heartbeat:setInterval(heartbeat, 1000)};
+          }
           term.reset();
           term.focus();
           try { ws.send(JSON.stringify({type:'resize',cols:term.cols,rows:term.rows})); } catch (_) {}
@@ -299,11 +474,13 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
           try { ws.close(1008, 'Rejected'); } catch (_) {}
         } else if (msg.type === 'closed') {
           reason = String(msg.message || 'SSH session ended.');
-          try { ws.close(); } catch (_) {}
+          control(ws, msg);
+        } else {
+          control(ws, msg);
         }
       } else if (sessionReady) {
-        if (data instanceof ArrayBuffer) term.write(new Uint8Array(data));
-        else if (data instanceof Blob) term.write(new Uint8Array(await data.arrayBuffer()));
+        if (data instanceof ArrayBuffer) writeOutput(new Uint8Array(data));
+        else if (data instanceof Blob) writeOutput(new Uint8Array(await data.arrayBuffer()));
       }
     };
     ws.onerror = () => {
@@ -312,9 +489,11 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
         toast(reason, 'error');
       }
     };
-    ws.onclose = () => {
+    ws.onclose = event => {
       if (socket !== ws) return;
       clearTimeout(connectTimer);
+      if (sessionReady && resume && !ended && event.code !== 1000 && event.code !== 4000) { linkLost(); return; }
+      stopResume();
       const wasLive = sessionReady;
       socket = null;
       sessionReady = connecting = false;
@@ -335,7 +514,7 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
   } catch (_) {}
   initTerminal();
   status('offline', 'Offline');
-  window.addEventListener('beforeunload', () => {if (socket) socket.close();});
+  window.addEventListener('pagehide', () => { if (socket || reconnecting) disconnect(); });
 })();
 </script>
 </body></html>

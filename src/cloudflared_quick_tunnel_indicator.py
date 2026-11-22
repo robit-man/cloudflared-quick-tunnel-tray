@@ -377,7 +377,10 @@ class TunnelIndicator:
             connected = datetime.fromisoformat(session["connected_at"]).astimezone().strftime("%H:%M:%S")
             entry = Gtk.MenuItem(label=f"{session['user']} · {session_id[:8]}")
             details = Gtk.Menu()
-            labels = [f"Browser attached at {connected}"]
+            if session.get("attached", True):
+                labels = [f"Browser attached at {connected}"]
+            else:
+                labels = [f"Waiting for browser to reconnect (last attached {connected})"]
             if session.get("client_ip"):
                 labels.append(f"Client IP {session['client_ip']}")
             for label in labels:
