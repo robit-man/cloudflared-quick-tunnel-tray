@@ -1,0 +1,11 @@
+[Unit]
+Description=Install Cloudflare Quick Tunnel Tray updates while no browser terminal is attached
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/cloudflared-quick-tunnel-update --auto
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+TimeoutStartSec=6min
+TimeoutStopSec=45s

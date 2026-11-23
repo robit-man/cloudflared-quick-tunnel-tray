@@ -448,6 +448,13 @@ def handle_request(uid: int, gid: int, request: dict[str, Any]) -> dict[str, Any
     action = request.get("action")
     if action == "ping":
         return {"ok": True, "version": VERSION}
+    if action == "slots":
+        # The automatic updater (root) waits for idle tunnels and restores them.
+        if uid != 0:
+            raise RequestError("Only root can list every tunnel slot")
+        with MANAGER.lock:
+            sessions = list(MANAGER.sessions.values())
+        return {"ok": True, "slots": [session.status() for session in sessions]}
 
     session = MANAGER.session_for_peer(uid, gid)
     if action == "status":

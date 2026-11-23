@@ -191,6 +191,8 @@ cat > "$manifest" <<'FILES'
 0755 src/cloudflared_quick_tunnel_indicator.py /usr/local/bin/cloudflared-quick-tunnel-indicator
 0644 systemd/cloudflared-quick-tunnel.service /etc/systemd/system/cloudflared-quick-tunnel.service
 0644 systemd/cloudflared-quick-tunnel-update.service /etc/systemd/system/cloudflared-quick-tunnel-update.service
+0644 systemd/cloudflared-quick-tunnel-auto-update.service /etc/systemd/system/cloudflared-quick-tunnel-auto-update.service
+0644 systemd/cloudflared-quick-tunnel-auto-update.timer /etc/systemd/system/cloudflared-quick-tunnel-auto-update.timer
 0644 systemd/cloudflared-quick-tunnel-indicator.service /etc/systemd/user/cloudflared-quick-tunnel-indicator.service
 0644 xdg/cloudflared-quick-tunnel-indicator.desktop /usr/share/applications/cloudflared-quick-tunnel-indicator.desktop
 FILES
@@ -254,6 +256,14 @@ if [ "$(systemctl show --property=LoadState --value "$broker")" != not-found ]; 
     systemctl stop "$broker"
 fi
 
+# Automatic updates start enabled on a first install. Later installs keep
+# whatever the administrator chose.
+auto_update_timer=cloudflared-quick-tunnel-auto-update.timer
+auto_update_new=false
+if [ ! -e "/etc/systemd/system/$auto_update_timer" ]; then
+    auto_update_new=true
+fi
+
 publishing=true
 while read -r mode source destination; do
     install -D -o root -g root -m "$mode" "$stage/new$destination" "$destination"
@@ -277,6 +287,9 @@ if ! systemctl --global is-enabled --quiet "$tray"; then
 fi
 systemctl enable "$broker"
 systemctl --global enable "$tray"
+if [ "$auto_update_new" = true ]; then
+    systemctl enable --now "$auto_update_timer"
+fi
 for uid in $managers; do
     user_ctl "$uid" daemon-reload
 done

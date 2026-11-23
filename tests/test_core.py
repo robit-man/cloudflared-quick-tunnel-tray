@@ -107,5 +107,13 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(output.getvalue().strip(), url)
 
 
+class SlotListingTests(unittest.TestCase):
+    def test_only_root_can_list_every_slot(self) -> None:
+        with self.assertRaisesRegex(daemon.RequestError, "Only root"):
+            daemon.handle_request(1000, 1000, {"action": "slots"})
+        with patch.object(daemon.MANAGER, "sessions", {}):
+            self.assertEqual(daemon.handle_request(0, 0, {"action": "slots"}), {"ok": True, "slots": []})
+
+
 if __name__ == "__main__":
     unittest.main()

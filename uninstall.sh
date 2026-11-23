@@ -7,6 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 systemctl stop cloudflared-quick-tunnel-update.service 2>/dev/null || true
+systemctl disable --now cloudflared-quick-tunnel-auto-update.timer 2>/dev/null || true
 systemctl disable --now cloudflared-quick-tunnel.service 2>/dev/null || true
 systemctl --global disable cloudflared-quick-tunnel-indicator.service 2>/dev/null || true
 
@@ -22,6 +23,8 @@ rm -f \
     /usr/local/bin/cloudflared-quick-tunnel-indicator \
     /etc/systemd/system/cloudflared-quick-tunnel.service \
     /etc/systemd/system/cloudflared-quick-tunnel-update.service \
+    /etc/systemd/system/cloudflared-quick-tunnel-auto-update.service \
+    /etc/systemd/system/cloudflared-quick-tunnel-auto-update.timer \
     /etc/systemd/user/cloudflared-quick-tunnel-indicator.service \
     /usr/share/applications/cloudflared-quick-tunnel-indicator.desktop
 

@@ -77,3 +77,56 @@ class UpdateTests(unittest.TestCase):
             update.install_latest()
             download.assert_not_called()
             run.assert_not_called()
+
+
+INSTALLED = "1b" * 20
+
+
+def slot(user, state="ready", mode="browser-tty", port=22, sessions=()):
+    return {"owner_user": user, "state": state, "mode": mode, "port": port, "browser_sessions": list(sessions)}
+
+
+class AutomaticUpdateTests(unittest.TestCase):
+    def run_auto(self, slots, latest=REVISION):
+        with (
+            patch.object(update, "latest_revision", return_value=latest),
+            patch.object(update, "installed_revision", return_value=INSTALLED),
+            patch.object(update, "tunnel_slots", return_value=slots),
+            patch.object(update, "install_latest") as install,
+            patch.object(update.subprocess, "run") as run,
+            patch.object(update.shutil, "which", return_value="/usr/sbin/runuser"),
+            patch("builtins.print"),
+        ):
+            run.return_value.returncode = 0
+            update.install_when_idle()
+        return install, run
+
+    def test_current_revision_does_nothing(self) -> None:
+        install, run = self.run_auto([slot("roko")], latest=INSTALLED)
+        install.assert_not_called()
+        run.assert_not_called()
+
+    def test_attached_browser_terminal_defers_the_update(self) -> None:
+        busy = slot("roko", sessions=[{"id": "a" * 32, "attached": True}])
+        install, run = self.run_auto([busy, slot("other")])
+        install.assert_not_called()
+        run.assert_not_called()
+
+    def test_detached_sessions_do_not_block_and_tunnels_come_back(self) -> None:
+        detached = slot("roko", sessions=[{"id": "a" * 32, "attached": False}])
+        native = slot("dev", mode="native", port=8080)
+        stopped = slot("idle", state="stopped")
+        install, run = self.run_auto([detached, native, stopped])
+        install.assert_called_once_with()
+        commands = [call.args[0] for call in run.call_args_list]
+        ctl = "/usr/local/bin/cloudflared-quick-tunnelctl"
+        self.assertEqual(commands, [
+            ["/usr/sbin/runuser", "-u", "roko", "--", ctl, "start", "--browser"],
+            ["/usr/sbin/runuser", "-u", "dev", "--", ctl, "start", "--port", "8080"],
+        ])
+
+    def test_restore_ignores_malformed_slots(self) -> None:
+        for bad in (slot("", ), slot(None), slot("roko", mode="other"), slot("roko", mode="native", port=True),
+                    slot("roko", mode="native", port=70000)):
+            with self.subTest(slot=bad):
+                self.assertIsNone(update.restore_command(bad))

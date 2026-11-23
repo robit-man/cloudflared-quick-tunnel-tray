@@ -80,6 +80,26 @@ has no Polkit authentication agent, you can run
 upgrade. See update errors with
 `sudo journalctl -u cloudflared-quick-tunnel-update.service`.
 
+### Automatic updates
+
+A system timer checks GitHub 3 minutes after boot and every 5 minutes after
+that. When `main` has a new commit, it installs the update, unless a browser
+terminal is attached. Installing restarts the broker, which would end those
+terminals, so the timer waits and tries again on the next check. qtty sessions
+keep running through an update. Tunnels that were running start again in the
+same mode and port as their owner, with a new address that the tray shows.
+
+The timer is enabled on a first install, and later installs keep your choice.
+Turn it off or back on with:
+
+```bash
+sudo systemctl disable --now cloudflared-quick-tunnel-auto-update.timer
+sudo systemctl enable --now cloudflared-quick-tunnel-auto-update.timer
+```
+
+See its decisions with
+`journalctl -u cloudflared-quick-tunnel-auto-update.service`.
+
 ## Tray actions
 
 - **Copy endpoint** — copies only the generated hostname.
