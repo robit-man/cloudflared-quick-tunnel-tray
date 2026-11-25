@@ -22,8 +22,9 @@ import time
 import tty
 from pathlib import Path
 
-# Installed copies keep the holder module in /usr/local/libexec.
-for _directory in (Path(__file__).resolve().parent, Path("/usr/local/libexec")):
+# The installed command and its holder use the same /usr or /usr/local prefix.
+_program = Path(__file__).resolve()
+for _directory in (_program.parent, _program.parent.parent / "libexec"):
     if (_directory / "cloudflared_quick_tunnel_qtty_holder.py").is_file():
         sys.path.insert(0, str(_directory))
         break

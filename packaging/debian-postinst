@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+broker=cloudflared-quick-tunnel.service
+tray=cloudflared-quick-tunnel-indicator.service
+
+if [ "${1:-}" = configure ]; then
+    if deb-systemd-helper was-enabled "$broker"; then
+        deb-systemd-helper enable "$broker" >/dev/null
+    else
+        deb-systemd-helper update-state "$broker" >/dev/null
+    fi
+    deb-systemd-helper --user enable "$tray" >/dev/null
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if [ -n "${2:-}" ]; then
+            deb-systemd-invoke try-restart "$broker"
+        else
+            deb-systemd-invoke start "$broker"
+        fi
+        deb-systemd-invoke --user daemon-reload
+        deb-systemd-invoke --user try-restart "$tray"
+    fi
+fi

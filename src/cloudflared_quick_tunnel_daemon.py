@@ -29,10 +29,13 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 SOCKET_PATH = Path("/run/cloudflared-quick-tunnel/control.sock")
 EXECUTABLE_PATH = "/usr/local/bin:/usr/bin:/bin"
-CLOUDFLARED = shutil.which("cloudflared", path=EXECUTABLE_PATH) or "/usr/local/bin/cloudflared"
+BUNDLED_CLOUDFLARED = Path(__file__).with_name("cloudflared-quick-tunnel-cloudflared")
+CLOUDFLARED = str(BUNDLED_CLOUDFLARED) if BUNDLED_CLOUDFLARED.is_file() else (
+    shutil.which("cloudflared", path=EXECUTABLE_PATH) or "/usr/local/bin/cloudflared"
+)
 SETPRIV = shutil.which("setpriv", path=EXECUTABLE_PATH) or "/usr/bin/setpriv"
 GATEWAY = Path(__file__).with_name("cloudflared_quick_tunnel_gateway.py")
 NATIVE_MODE = "native"
@@ -125,7 +128,7 @@ class TunnelSession:
             "endpoint": self.endpoint,
             "endpoint_url": f"https://{self.endpoint}" if self.endpoint else None,
             "browser_url": (
-                f"https://{self.endpoint}/#tty={self.token}"
+                f"https://{self.endpoint}/#tty=v2.{self.token}"
                 if self.state == "ready" and self.endpoint and self.token else None
             ),
             "browser_sessions": browser_sessions or [],

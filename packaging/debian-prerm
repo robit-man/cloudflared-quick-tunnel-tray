@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = remove ] && [ -d /run/systemd/system ]; then
+    deb-systemd-invoke --user stop cloudflared-quick-tunnel-indicator.service
+    deb-systemd-invoke stop cloudflared-quick-tunnel.service
+fi

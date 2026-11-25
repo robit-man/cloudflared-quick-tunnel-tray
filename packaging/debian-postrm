@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = remove ] || [ "${1:-}" = purge ]; then
+    deb-systemd-helper purge cloudflared-quick-tunnel.service >/dev/null
+    deb-systemd-helper --user purge cloudflared-quick-tunnel-indicator.service >/dev/null
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        deb-systemd-invoke --user daemon-reload
+    fi
+fi

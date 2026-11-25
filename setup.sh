@@ -27,14 +27,14 @@ install_dependencies() {
         as_root apt-get update
         as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
-            gir1.2-notify-0.7 openssh-client python3-websockets util-linux wl-clipboard pkexec
+            gir1.2-notify-0.7 openssh-client python3-cryptography python3-websockets util-linux wl-clipboard pkexec
     elif command -v dnf >/dev/null 2>&1; then
         as_root dnf install -y \
-            python3 python3-gobject python3-websockets gtk3 libayatana-appindicator-gtk3 \
+            python3 python3-gobject python3-cryptography python3-websockets gtk3 libayatana-appindicator-gtk3 \
             libnotify openssh-clients util-linux wl-clipboard polkit
     elif command -v pacman >/dev/null 2>&1; then
         as_root pacman -S --needed --noconfirm \
-            python python-gobject python-websockets gtk3 libayatana-appindicator \
+            python python-gobject python-cryptography python-websockets gtk3 libayatana-appindicator \
             libnotify openssh util-linux wl-clipboard polkit
     else
         echo "Checking existing dependencies on this distribution."

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = install ] && [ -f /etc/systemd/system/cloudflared-quick-tunnel.service ] &&
+    [ -x /usr/local/libexec/cloudflared-quick-tunnel-daemon ]; then
+    echo 'A setup.sh installation already manages this service. Upgrade it with setup.sh, or remove it with uninstall.sh before installing this package.' >&2
+    exit 1
+fi

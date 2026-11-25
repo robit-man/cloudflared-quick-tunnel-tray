@@ -19,11 +19,14 @@ import os
 import secrets
 import signal
 import struct
+import sys
 import termios
 from datetime import datetime, timezone
 from typing import Callable
 
 from websockets.exceptions import ConnectionClosed
+
+from cloudflared_quick_tunnel_noise import SecureTransportError
 
 
 MAX_CONTROL_SIZE = 4096
@@ -90,8 +93,9 @@ def start_ssh(command: list[str], cols: int, rows: int) -> tuple[int, int]:
     if pid == 0:
         try:
             # A forced gateway exit must also close detached controlling PTYs.
-            death_signal = LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
-            if death_signal != 0 or os.getppid() != parent:
+            if sys.platform == "linux" and LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0):
+                os._exit(126)
+            if os.getppid() != parent:
                 os._exit(126)
             os.close(master)
             os.setsid()
@@ -288,7 +292,7 @@ class TerminalSession:
         self.client_ip = client_ip(websocket)
         if previous is not None:
             # The old network path is usually dead; never wait on its close.
-            self._spawn(previous.websocket.close(4000, "Resumed by another connection"))
+            self._spawn(self._close_attachment(previous, "Resumed by another connection"))
         return self.attachment
 
     async def serve(self, attachment: Attachment, header: dict) -> None:
@@ -307,7 +311,7 @@ class TerminalSession:
                 task.result()
             if tasks[0] in done:
                 self.ending = True
-        except ConnectionClosed:
+        except (ConnectionClosed, SecureTransportError):
             raise
         except BaseException:
             self.ending = True
@@ -329,10 +333,17 @@ class TerminalSession:
         self.ending = True
         attachment = self.attachment
         if attachment is not None:
-            await attachment.websocket.close(1000, reason)
+            await self._close_attachment(attachment, reason)
         else:
             await self.close()
         await self.finished.wait()
+
+    async def _close_attachment(self, attachment: Attachment, reason: str) -> None:
+        try:
+            await asyncio.wait_for(attachment.websocket.send(json.dumps({"type": "closed", "message": reason})), 1)
+        except (asyncio.TimeoutError, ConnectionClosed):
+            pass
+        await attachment.websocket.close()
 
     async def close(self) -> None:
         if self._closed:

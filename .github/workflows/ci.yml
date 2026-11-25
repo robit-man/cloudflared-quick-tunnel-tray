@@ -2,14 +2,16 @@ name: CI
 
 on:
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -21,12 +23,17 @@ jobs:
             gir1.2-ayatanaappindicator3-0.1 \
             gir1.2-notify-0.7 \
             openssh-client \
+            python3-cryptography \
             python3-gi \
             python3-websockets \
+            python3-venv \
             shellcheck
 
       - name: Run unit tests
-        run: /usr/bin/python3 -m unittest discover -s tests -v
+        run: |
+          /usr/bin/python3 -m venv --system-site-packages "$RUNNER_TEMP/test-env"
+          "$RUNNER_TEMP/test-env/bin/python" -m pip install noiseprotocol==0.3.1
+          "$RUNNER_TEMP/test-env/bin/python" -m unittest discover -s tests -v
 
       - name: Validate Python syntax
         run: python3 -m py_compile src/*.py

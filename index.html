@@ -114,10 +114,164 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
 `,e)}paste(s){this._core.paste(s)}refresh(s,e){this._verifyIntegers(s,e),this._core.refresh(s,e)}reset(){this._core.reset()}clearTextureAtlas(){this._core.clearTextureAtlas()}loadAddon(s){this._addonManager.loadAddon(this,s)}static get strings(){return r}_verifyIntegers(...s){for(const e of s)if(e===1/0||isNaN(e)||e%1!=0)throw new Error("This API only accepts integers")}_verifyPositiveIntegers(...s){for(const e of s)if(e&&(e===1/0||isNaN(e)||e%1!=0||e<0))throw new Error("This API only accepts positive integers")}}O.Terminal=h})(),Q})()))})(fe)),fe.exports}var we=be(),ve={exports:{}},ge;function ye(){return ge||(ge=1,(function(ce,Se){(function(ie,Y){ce.exports=Y()})(self,(()=>(()=>{var ie={};return(()=>{var Y=ie;Object.defineProperty(Y,"__esModule",{value:!0}),Y.FitAddon=void 0,Y.FitAddon=class{activate(G){this._terminal=G}dispose(){}fit(){const G=this.proposeDimensions();if(!G||!this._terminal||isNaN(G.cols)||isNaN(G.rows))return;const Q=this._terminal._core;this._terminal.rows===G.rows&&this._terminal.cols===G.cols||(Q._renderService.clear(),this._terminal.resize(G.cols,G.rows))}proposeDimensions(){if(!this._terminal||!this._terminal.element||!this._terminal.element.parentElement)return;const G=this._terminal._core,Q=G._renderService.dimensions;if(Q.css.cell.width===0||Q.css.cell.height===0)return;const O=this._terminal.options.scrollback===0?0:G.viewport.scrollBarWidth,r=window.getComputedStyle(this._terminal.element.parentElement),a=parseInt(r.getPropertyValue("height")),l=Math.max(0,parseInt(r.getPropertyValue("width"))),_=window.getComputedStyle(this._terminal.element),n=a-(parseInt(_.getPropertyValue("padding-top"))+parseInt(_.getPropertyValue("padding-bottom"))),d=l-(parseInt(_.getPropertyValue("padding-right"))+parseInt(_.getPropertyValue("padding-left")))-O;return{cols:Math.max(2,Math.floor(d/Q.css.cell.width)),rows:Math.max(1,Math.floor(n/Q.css.cell.height))}}}})(),ie})()))})(ve)),ve.exports}var Ee=ye();const ke={Terminal:we.Terminal,FitAddon:Ee.FitAddon};window.XTERM_BUNDLE=ke;
 </script><script>
 (() => {
+  // Noise rev. 34 NNpsk0, X25519/AES-GCM/SHA-256. Only empty handshake payloads.
+  const protocol = new TextEncoder().encode('Noise_NNpsk0_25519_AESGCM_SHA256');
+  const prologue = new TextEncoder().encode('tty-websocket-v2');
+  const empty = new Uint8Array();
+  const maxPayload = 65535 - 17;
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder('utf-8', {fatal: true});
+  const join = (a, b) => {
+    const result = new Uint8Array(a.length + b.length);
+    result.set(a);
+    result.set(b, a.length);
+    return result;
+  };
+  const mixHash = async (hash, data) => new Uint8Array(await crypto.subtle.digest('SHA-256', join(hash, data)));
+  const importCipher = (raw, usage) => crypto.subtle.importKey('raw', raw, 'AES-GCM', false, [usage]);
+
+  async function hkdf(chain, material, count) {
+    // RFC 5869 with empty info. Web Crypto HMAC also accepts Noise Split's empty IKM.
+    const hmac = raw => crypto.subtle.importKey('raw', raw, {name: 'HMAC', hash: 'SHA-256'}, false, ['sign']);
+    const prk = await crypto.subtle.sign('HMAC', await hmac(chain), material);
+    const key = await hmac(prk);
+    const output = [];
+    let previous = empty;
+    for (let index = 1; index <= count; index++) {
+      previous = new Uint8Array(await crypto.subtle.sign('HMAC', key, join(previous, Uint8Array.of(index))));
+      output.push(previous);
+    }
+    return output;
+  }
+
+  function cipher(sequence = 0, additionalData = empty) {
+    const iv = new Uint8Array(12);
+    if (sequence >= 2 ** 32) throw new Error('Noise record limit reached');
+    new DataView(iv.buffer).setUint32(8, sequence);
+    return {name: 'AES-GCM', iv, additionalData};
+  }
+
+  async function initiate(secret) {
+    const psk = Uint8Array.from(atob(secret.replace(/-/g, '+').replace(/_/g, '/') + '='), char => char.charCodeAt(0));
+    const initial = new Uint8Array(32);
+    initial.set(protocol);
+    let hash = await mixHash(initial, prologue);
+    let [chain, pskHash] = await hkdf(initial, psk, 3);
+    hash = await mixHash(hash, pskHash);
+    const ephemeral = await crypto.subtle.generateKey('X25519', false, ['deriveBits']);
+    const publicKey = new Uint8Array(await crypto.subtle.exportKey('raw', ephemeral.publicKey));
+    hash = await mixHash(hash, publicKey);
+    let key;
+    [chain, key] = await hkdf(chain, publicKey, 2);
+    const tag = new Uint8Array(await crypto.subtle.encrypt(cipher(0, hash), await importCipher(key, 'encrypt'), empty));
+    hash = await mixHash(hash, tag);
+
+    return {
+      message: join(publicKey, tag),
+      async finish(frame) {
+        if (!(frame instanceof ArrayBuffer) || frame.byteLength !== 48) throw new Error('Invalid Noise reply');
+        const reply = new Uint8Array(frame);
+        const peerKey = reply.subarray(0, 32);
+        hash = await mixHash(hash, peerKey);
+        [chain] = await hkdf(chain, peerKey, 2);
+        const publicPeer = await crypto.subtle.importKey('raw', peerKey, 'X25519', false, []);
+        const shared = await crypto.subtle.deriveBits({name: 'X25519', public: publicPeer}, ephemeral.privateKey, 256);
+        [chain, key] = await hkdf(chain, shared, 2);
+        await crypto.subtle.decrypt(cipher(0, hash), await importCipher(key, 'decrypt'), reply.subarray(32));
+        const [outgoing, incoming] = await hkdf(chain, empty, 2);
+        return Promise.all([importCipher(outgoing, 'encrypt'), importCipher(incoming, 'decrypt')]);
+      }
+    };
+  }
+
+  class TerminalSocket {
+    constructor(host, secret) {
+      if (!crypto.subtle) throw new Error('Open TTY on HTTPS to use encrypted terminals.');
+      this.wire = new WebSocket('wss://' + host + '/ws/v2');
+      this.wire.binaryType = 'arraybuffer';
+      this.receiving = Promise.resolve();
+      this.sending = Promise.resolve();
+      this.readSequence = 0;
+      this.writeSequence = 0;
+      this.queued = 0;
+      this.wire.onopen = async () => {
+        try {
+          this.handshake = await initiate(secret);
+          secret = '';
+          if (!this.closing && this.wire.readyState === WebSocket.OPEN) this.wire.send(this.handshake.message);
+        } catch (_) {
+          this.fail('This browser could not start an encrypted connection. Try updating your browser.');
+        }
+      };
+      this.wire.onmessage = ({data}) => {
+        this.queued += data.byteLength || data.length || 0;
+        if (this.queued > 16 * 1024 * 1024) {
+          this.fail('The terminal sent data faster than this browser could process it.');
+          return;
+        }
+        this.receiving = this.receiving.then(async () => {
+          if (this.closing) return;
+          if (!this.incoming) {
+            [this.outgoing, this.incoming] = await this.handshake.finish(data);
+            this.handshake = null;
+            if (!this.closing) this.onopen?.();
+            return;
+          }
+          if (!(data instanceof ArrayBuffer) || data.byteLength < 17 || data.byteLength > 65535) {
+            throw new Error('Invalid Noise frame');
+          }
+          const body = new Uint8Array(await crypto.subtle.decrypt(cipher(this.readSequence++), this.incoming, data));
+          if (body[0] !== 0 && body[0] !== 1) throw new Error('Invalid Noise message type');
+          if (!this.closing) this.onmessage?.({data: body[0] === 0 ? decoder.decode(body.subarray(1)) : body.buffer.slice(1)});
+        }).catch(() => {
+          this.fail('Couldn’t verify the encrypted terminal connection. Copy a fresh link from the tray.');
+        }).finally(() => { this.queued -= data.byteLength || data.length || 0; });
+      };
+      this.wire.onerror = () => this.onerror?.();
+      this.wire.onclose = async () => {
+        await this.receiving;
+        this.onclose?.({secureError: this.secureError});
+      };
+    }
+
+    get readyState() {
+      if (this.closing || this.wire.readyState >= WebSocket.CLOSING) return WebSocket.CLOSING;
+      return this.incoming ? WebSocket.OPEN : WebSocket.CONNECTING;
+    }
+
+    send(message) {
+      if (this.readyState !== WebSocket.OPEN) return;
+      const text = typeof message === 'string';
+      const bytes = text ? encoder.encode(message) : message;
+      this.sending = this.sending.then(async () => {
+        for (let start = 0; start < Math.max(1, bytes.length); start += maxPayload) {
+          if (this.wire.readyState !== WebSocket.OPEN) return;
+          const body = join(Uint8Array.of(text ? 0 : 1), bytes.subarray(start, start + maxPayload));
+          const frame = await crypto.subtle.encrypt(cipher(this.writeSequence++), this.outgoing, body);
+          if (this.wire.readyState === WebSocket.OPEN) this.wire.send(frame);
+        }
+      }).catch(() => this.fail('The encrypted terminal connection was interrupted.'));
+    }
+
+    close(code = 1000) {
+      if (this.closing) return;
+      this.closing = true;
+      if (!this.outgoing) this.wire.close(code);
+      else this.sending.finally(() => this.wire.close(code));
+    }
+
+    fail(message) {
+      this.secureError = message;
+      this.closing = true;
+      this.wire.close(4002);
+    }
+  }
+  window.TTYTerminalSocket = TerminalSocket;
+})();
+</script>
+<script>
+(() => {
   'use strict';
-  // Browser TTY v1. Contract: Quick Tunnel HTTPS -> loopback HTTP/WebSocket
-  // /ws. First frame: JSON hello with a token copied in URL fragment #tty=...;
-  // subsequent binary messages are PTY bytes, text messages are control JSON.
   const $ = id => document.getElementById(id);
   const {Terminal, FitAddon} = window.XTERM_BUNDLE || {};
   const endpointEl = $('endpoint'), usernameEl = $('username');
@@ -163,14 +317,10 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     const host = url.hostname.toLowerCase();
     if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com$/.test(host))
       throw new Error('The hostname must end in .trycloudflare.com.');
-    // The fragment is local-only: no token in HTTP URL, WebSocket URL, or logs.
-    let fragment = url.hash.slice(1);
-    let token = '';
-    if (fragment.startsWith('tty=')) token = new URLSearchParams(fragment).get('tty') || '';
-    else if (fragment.startsWith('token=')) token = new URLSearchParams(fragment).get('token') || '';
-    if (!/^[A-Za-z0-9_-]{32,128}$/.test(token))
-      throw new Error('Missing browser-terminal token. In the tray, choose Copy browser terminal link (includes #tty=…).');
-    return { host, token };
+    const token = new URLSearchParams(url.hash.slice(1)).get('tty') || '';
+    if (!/^v2\.[A-Za-z0-9_-]{43}$/.test(token))
+      throw new Error('Copy a fresh encrypted browser-terminal link from the updated tray.');
+    return {host, token: token.slice(3)};
   }
   function sendInput(bytes) {
     if (resume) {
@@ -252,10 +402,9 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
   function resumeSocket() {
     if (!resume || !reconnecting || socket) return;
     let ws;
-    try { ws = new WebSocket(`wss://${resume.host}/ws`); }
+    try { ws = new window.TTYTerminalSocket(resume.host, resume.key); }
     catch (_) { scheduleResume(); return; }
     socket = ws;
-    ws.binaryType = 'arraybuffer';
     const timer = setTimeout(() => { if (socket === ws) { dropSocket(); scheduleResume(); } }, timing.attempt);
     ws.onopen = () => {
       try { fit.fit(); } catch (_) {}
@@ -298,8 +447,8 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     if (msg.type === 'pong') acknowledge(msg.in);
     else if (msg.type === 'closed') { ended = true; try { ws.close(); } catch (_) {} }
   }
-  function closedOnline({code}) {
-    if (resume && !ended && code !== 1000 && code !== 4000) { linkLost(); return; }
+  function closedOnline() {
+    if (resume && !ended) { linkLost(); return; }
     disconnect(ended ? 'SSH session ended.' : 'Remote session disconnected.');
   }
   function stopResume() {
@@ -424,12 +573,10 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     }
     // No tunnel tokens, passwords or private keys are stored in localStorage.
     try { localStorage.setItem('tty-last-host', dest.host); localStorage.setItem('tty-last-user', user); } catch (_) {}
-    const wsUrl = `wss://${dest.host}/ws`;
     let ws;
-    try { ws = new WebSocket(wsUrl); }
+    try { ws = new window.TTYTerminalSocket(dest.host, dest.token); }
     catch (e) { toast('WebSocket setup failed: ' + e.message, 'error'); return; }
     socket = ws;
-    ws.binaryType = 'arraybuffer';
     sessionReady = false;
     ended = false;
     connecting = true;
@@ -445,7 +592,7 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     }, 20000);
     ws.onopen = () => {
       try { fit.fit(); } catch (_) {}
-      ws.send(JSON.stringify({type:'hello', v:1, token:dest.token, user, cols:term.cols, rows:term.rows, resume:true}));
+      ws.send(JSON.stringify({type:'hello', v:1, user, cols:term.cols, rows:term.rows, resume:true}));
       term.focus();
     };
     ws.onmessage = async ({data}) => {
@@ -461,7 +608,7 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
           setControls();
           status('online', 'Session open');
           if (typeof msg.session === 'string' && typeof msg.resume === 'string') {
-            resume = {host:dest.host, id:msg.session, secret:msg.resume, offset:0, pending:[], pendingBytes:0,
+            resume = {host:dest.host, key:dest.token, id:msg.session, secret:msg.resume, offset:0, pending:[], pendingBytes:0,
               acked:0, lastSeen:performance.now(), awaiting:0, limit:timing.answer, since:0, attempt:0, retry:0,
               heartbeat:setInterval(heartbeat, 1000)};
           }
@@ -471,7 +618,7 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
         } else if (msg.type === 'error') {
           reason = String(msg.message || 'Terminal gateway rejected the session.');
           toast(reason, 'error');
-          try { ws.close(1008, 'Rejected'); } catch (_) {}
+          try { ws.close(); } catch (_) {}
         } else if (msg.type === 'closed') {
           reason = String(msg.message || 'SSH session ended.');
           control(ws, msg);
@@ -485,15 +632,16 @@ WARNING: This link could potentially be dangerous`)){const s=window.open();if(s)
     };
     ws.onerror = () => {
       if (!sessionReady && !reason) {
-        reason = 'WebSocket failed. The tunnel must forward to the tray\'s HTTP/WebSocket terminal gateway, not directly to ssh://127.0.0.1:22.';
+        reason = 'Couldn’t reach the encrypted terminal gateway. Check that the tray is up to date and copy a fresh link.';
         toast(reason, 'error');
       }
     };
     ws.onclose = event => {
       if (socket !== ws) return;
       clearTimeout(connectTimer);
-      if (sessionReady && resume && !ended && event.code !== 1000 && event.code !== 4000) { linkLost(); return; }
+      if (sessionReady && resume && !ended) { linkLost(); return; }
       stopResume();
+      reason = event.secureError || reason;
       const wasLive = sessionReady;
       socket = null;
       sessionReady = connecting = false;

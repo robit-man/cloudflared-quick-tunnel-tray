@@ -181,7 +181,8 @@ class TunnelIndicator:
         self.menu.append(Gtk.SeparatorMenuItem())
         self.update_item = Gtk.MenuItem(label="Check for updates")
         self.update_item.connect("activate", self.select_update)
-        self.menu.append(self.update_item)
+        if os.access(UPDATE_HELPER, os.X_OK):
+            self.menu.append(self.update_item)
 
         self.quit_item = Gtk.MenuItem(label="Quit indicator")
         self.quit_item.connect("activate", lambda _item: Gtk.main_quit())
@@ -190,9 +191,10 @@ class TunnelIndicator:
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
         self.refresh()
-        self.check_for_updates()
         GLib.timeout_add_seconds(4, self.periodic_refresh)
-        GLib.timeout_add_seconds(30 * 60, self.check_for_updates)
+        if os.access(UPDATE_HELPER, os.X_OK):
+            self.check_for_updates()
+            GLib.timeout_add_seconds(30 * 60, self.check_for_updates)
 
     def periodic_refresh(self) -> bool:
         if not self.busy:

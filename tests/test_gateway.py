@@ -1,22 +1,60 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import secrets
 import socket
 import subprocess
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from websockets.exceptions import ConnectionClosedError, InvalidStatusCode
+from noise.connection import NoiseConnection
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK, InvalidStatusCode
 from websockets.legacy.client import connect
 
 from test_core import ROOT, load_module
 
 
 gateway = load_module("quick_tunnel_gateway", ROOT / "src/cloudflared_quick_tunnel_gateway.py")
+
+
+def reference_initiator(token: str) -> NoiseConnection:
+    noise = NoiseConnection.from_name(b"Noise_NNpsk0_25519_AESGCM_SHA256")
+    noise.set_as_initiator()
+    noise.set_prologue(b"tty-websocket-v2")
+    noise.set_psks(psk=base64.urlsafe_b64decode(token + "="))
+    noise.start_handshake()
+    return noise
+
+
+class NoiseClient:
+    def __init__(self, wire, noise):
+        self.wire = wire
+        self.noise = noise
+
+    async def send(self, value):
+        marker, body = (b"\x00", value.encode()) if isinstance(value, str) else (b"\x01", value)
+        for pos in range(0, max(1, len(body)), 65518):
+            await self.wire.send(self.noise.encrypt(marker + body[pos:pos + 65518]))
+
+    async def recv(self):
+        body = self.noise.decrypt(await self.wire.recv())
+        return body[1:].decode() if body[:1] == b"\x00" else body[1:]
+
+    async def close(self):
+        await self.wire.close()
+
+    @property
+    def transport(self):
+        return self.wire.transport
+
+    @property
+    def close_code(self):
+        return self.wire.close_code
 
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
@@ -45,7 +83,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(self.server_task, return_exceptions=True)
 
     def hello(self, **overrides) -> str:
-        hello = {"type": "hello", "v": 1, "user": "ubuntu", "token": self.token, "cols": 120, "rows": 35}
+        hello = {"type": "hello", "v": 1, "user": "ubuntu", "cols": 120, "rows": 35}
         return json.dumps(hello | overrides)
 
     async def request(self, action: str, **fields) -> dict:
@@ -53,31 +91,59 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         await loop.sock_sendall(self.control, json.dumps({"action": action, **fields}).encode())
         return json.loads(await asyncio.wait_for(loop.sock_recv(self.control, 16 * 1024), timeout=4))
 
-    async def test_wrong_token_and_invalid_parameters_never_start_ssh(self) -> None:
+    async def establish(self, wire):
+        noise = reference_initiator(self.token)
+        await wire.send(noise.write_message())
+        self.assertEqual(noise.read_message(await wire.recv()), b"")
+        return NoiseClient(wire, noise)
+
+    @asynccontextmanager
+    async def secure_connection(self, **kwargs):
+        async with connect(self.url + "/ws/v2", **kwargs) as wire:
+            yield await self.establish(wire)
+
+    async def test_wrong_secret_and_plaintext_never_start_ssh(self) -> None:
+        wrong_key = reference_initiator(secrets.token_urlsafe(32))
         with patch.object(gateway, "start_ssh") as start_ssh:
-            cases = (
-                (self.hello(token=secrets.token_urlsafe(32)), "unauthorized"),
-                (self.hello(token="🍕"), "unauthorized"),
-                (self.hello(user="-invalid"), "bad_request"),
-                (self.hello(cols=True), "bad_request"),
-                (self.hello(v=True), "bad_request"),
-            )
-            for message, code in cases:
-                async with connect(self.url + "/ws", origin="https://static.example") as websocket:
-                    await websocket.send(message)
-                    response = json.loads(await websocket.recv())
-                    self.assertEqual(response["type"], "error")
-                    self.assertEqual(response["code"], code)
-                    if code == "unauthorized":
-                        self.assertEqual(response["message"], "Invalid terminal token")
+            for frame in (self.hello(), wrong_key.write_message()):
+                async with connect(self.url + "/ws/v2") as wire:
+                    await wire.send(frame)
                     with self.assertRaises(ConnectionClosedError) as closed:
-                        await websocket.recv()
+                        await wire.recv()
                     self.assertEqual(closed.exception.code, 1008)
             start_ssh.assert_not_called()
         self.assertEqual((await self.request("list"))["sessions"], [])
 
+    async def test_invalid_login_parameters_never_start_ssh(self) -> None:
+        with patch.object(gateway, "start_ssh") as start_ssh:
+            for message in (self.hello(user="-invalid"), self.hello(cols=True), self.hello(v=True)):
+                async with self.secure_connection(origin="https://static.example") as websocket:
+                    await websocket.send(message)
+                    response = json.loads(await websocket.recv())
+                    self.assertEqual((response["type"], response["code"]), ("error", "bad_request"))
+                    with self.assertRaises(ConnectionClosedError):
+                        await websocket.recv()
+            start_ssh.assert_not_called()
+
+    async def test_modified_and_replayed_frames_cannot_reach_ssh(self) -> None:
+        with patch.object(gateway, "start_ssh") as start_ssh:
+            hello = b"\x00" + self.hello().encode()
+            async with self.secure_connection() as client:
+                frame = bytearray(client.noise.encrypt(hello))
+                frame[-1] ^= 1
+                await client.wire.send(frame)
+                with self.assertRaises(ConnectionClosedError):
+                    await client.wire.recv()
+            async with self.secure_connection() as previous:
+                saved = previous.noise.encrypt(hello)
+            async with self.secure_connection() as client:
+                await client.wire.send(saved)
+                with self.assertRaises(ConnectionClosedError):
+                    await client.wire.recv()
+            start_ssh.assert_not_called()
+
     async def test_only_exact_websocket_path_upgrades(self) -> None:
-        for path in ("/", "/session", "/ws?query=ignored"):
+        for path in ("/", "/session", "/ws", "/ws/v2?query=ignored"):
             with self.assertRaises(InvalidStatusCode) as rejected:
                 async with connect(self.url + path):
                     self.fail("Unexpected WebSocket upgrade")
@@ -106,7 +172,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         commands: list = []
         with self.fake_ssh("exec cat", commands), patch.object(gateway.os, "access", return_value=True):
             for name, expected in (("agent-1", "ready"), ("x; rm -rf ~", "error"), ("", "error"), (7, "error")):
-                async with connect(self.url + "/ws") as websocket:
+                async with self.secure_connection() as websocket:
                     await websocket.send(self.hello(attach=name))
                     self.assertEqual(json.loads(await websocket.recv())["type"], expected)
         self.assertEqual(len(commands), 1)
@@ -115,7 +181,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_hello_targets_only_loopback_ssh(self) -> None:
         commands: list = []
         with self.fake_ssh("exec cat", commands), patch.object(gateway.os, "access", return_value=True):
-            async with connect(self.url + "/ws", origin="https://static.example") as websocket:
+            async with self.secure_connection(origin="https://static.example") as websocket:
                 await websocket.send(self.hello(host="remote.example"))
                 self.assertEqual(json.loads(await websocket.recv()), {"type": "ready", "v": 1})
         command, cols, rows = commands[0]
@@ -128,7 +194,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
     async def test_binary_pty_round_trip(self) -> None:
         payload = bytes(range(256)) * 513
         with self.fake_ssh("stty raw -echo && printf 'start' && exec cat"):
-            async with connect(self.url + "/ws") as websocket:
+            async with self.secure_connection() as websocket:
                 await websocket.send(self.hello())
                 self.assertEqual(json.loads(await websocket.recv()), {"type": "ready", "v": 1})
                 self.assertEqual(await self.read_bytes(websocket, 5), b"start")
@@ -142,7 +208,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await websocket.recv(), b"ready")
 
         with self.fake_ssh("stty raw -echo && printf 'ready' && exec cat"):
-            async with connect(self.url + "/ws") as first, connect(self.url + "/ws") as second:
+            async with self.secure_connection() as first, self.secure_connection() as second:
                 await open_terminal(first, "first")
                 await open_terminal(second, "second")
                 registered = (await self.request("list"))["sessions"]
@@ -151,6 +217,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.request("end", id=first_id)
                 self.assertTrue(result["ended"])
                 self.assertEqual(result["sessions"], registered[1:])
+                self.assertEqual(json.loads(await first.recv()), {
+                    "type": "closed", "message": "Ended by tunnel owner",
+                })
                 self.assertEqual(first.close_code, 1000)
                 self.assertFalse((await self.request("end", id=first_id))["ended"])
                 await second.send(b"still alive")
@@ -158,7 +227,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_session_closes_its_pty_with_the_socket(self) -> None:
         with self.fake_ssh("stty raw -echo && printf 'ready' && exec cat"):
-            async with connect(self.url + "/ws") as websocket:
+            async with self.secure_connection() as websocket:
                 await websocket.send(self.hello())
                 await websocket.recv()
                 self.assertEqual(await websocket.recv(), b"ready")
@@ -169,7 +238,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.request("list"))["sessions"], [])
 
     async def open_resumable(self, script: str):
-        websocket = await connect(self.url + "/ws")
+        websocket = await self.establish(await connect(self.url + "/ws/v2"))
         await websocket.send(self.hello(resume=True))
         ready = json.loads(await websocket.recv())
         self.assertEqual((ready["type"], ready["v"]), ("ready", 1))
@@ -194,7 +263,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(sessions), 1)
             self.assertFalse(sessions[0]["attached"])
 
-            async with connect(self.url + "/ws") as second:
+            async with self.secure_connection() as second:
                 await second.send(self.resume(ready, 5))
                 resumed = json.loads(await second.recv())
                 self.assertEqual(resumed, {"type": "resumed", "v": 1, "in": 3, "offset": 5})
@@ -210,12 +279,13 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         with self.fake_ssh(script):
             first, ready = await self.open_resumable(script)
             self.assertEqual(await self.read_bytes(first, 5), b"ready")
-            async with connect(self.url + "/ws") as second:
+            async with self.secure_connection() as second:
                 await second.send(self.resume(ready, 5))
                 self.assertEqual(json.loads(await second.recv())["type"], "resumed")
-                with self.assertRaises(ConnectionClosedError):
-                    await asyncio.wait_for(first.recv(), timeout=3)
-                self.assertEqual(first.close_code, 4000)
+                notice = json.loads(await asyncio.wait_for(first.recv(), timeout=3))
+                self.assertEqual(notice, {"type": "closed", "message": "Resumed by another connection"})
+                with self.assertRaises(ConnectionClosedOK):
+                    await first.recv()
                 await second.send(b"live")
                 self.assertEqual(await self.read_bytes(second, 4), b"live")
 
@@ -229,7 +299,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 if not (await self.request("list"))["sessions"]:
                     break
                 await asyncio.sleep(0.05)
-            async with connect(self.url + "/ws") as second:
+            async with self.secure_connection() as second:
                 await second.send(self.resume(ready, 0))
                 self.assertEqual(json.loads(await second.recv())["code"], "expired")
 
@@ -241,10 +311,10 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.addAsyncCleanup(parent.close)
             fork = {"type": "fork", "v": 1, "session": ready["session"], "resume": ready["resume"],
                     "cols": 90, "rows": 20, "fork": "main"}
-            async with connect(self.url + "/ws") as websocket:
+            async with self.secure_connection() as websocket:
                 await websocket.send(json.dumps(fork | {"resume": secrets.token_urlsafe(32)}))
                 self.assertEqual(json.loads(await websocket.recv())["code"], "expired")
-            async with connect(self.url + "/ws") as websocket:
+            async with self.secure_connection() as websocket:
                 await websocket.send(json.dumps(fork))
                 child = json.loads(await websocket.recv())
                 self.assertEqual(child["type"], "ready")
@@ -266,7 +336,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             first, ready = await self.open_resumable(script)
             self.addAsyncCleanup(first.close)
             for secret in (secrets.token_urlsafe(32), "🍕", None):
-                async with connect(self.url + "/ws") as second:
+                async with self.secure_connection() as second:
                     await second.send(self.resume(ready, 0, resume=secret))
                     response = json.loads(await second.recv())
                     self.assertEqual(response["code"], "expired")
@@ -279,7 +349,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             first.transport.abort()
             await asyncio.sleep(0.6)  # SSH exits while no browser is attached.
-            async with connect(self.url + "/ws") as second:
+            async with self.secure_connection() as second:
                 await second.send(self.resume(ready, 0))
                 self.assertEqual(json.loads(await second.recv())["type"], "resumed")
                 received = bytearray()

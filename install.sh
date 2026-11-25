@@ -8,6 +8,11 @@ fi
 
 project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
+if [ -f /usr/lib/systemd/system/cloudflared-quick-tunnel.service ]; then
+    echo "Cloudflare Quick Tunnel Tray is managed by apt. Install an updated .deb to upgrade." >&2
+    exit 1
+fi
+
 for executable in cloudflared /usr/bin/python3 /usr/bin/ssh setpriv systemctl flock runuser getent; do
     if ! command -v "$executable" >/dev/null 2>&1; then
         echo "Missing required executable: $executable" >&2
@@ -24,8 +29,9 @@ if sys.version_info < (3, 10):
 
 try:
     from websockets.legacy.server import serve
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 except ImportError as exc:
-    sys.exit(f"Could not load the system websockets package ({exc}). Run ./setup.sh to install dependencies.")
+    sys.exit(f"Could not load the system WebSocket and cryptography dependencies ({exc}). Run ./setup.sh to install dependencies.")
 
 try:
     import gi
@@ -41,7 +47,7 @@ try:
 except (ImportError, ValueError) as exc:
     sys.exit(f"Could not load GTK or AppIndicator bindings ({exc}). Run ./setup.sh to install dependencies.")
 
-for component in ("daemon", "gateway", "terminal", "qtty", "qtty_holder", "ctl", "indicator", "update"):
+for component in ("daemon", "gateway", "noise", "terminal", "qtty", "qtty_holder", "ctl", "indicator", "update"):
     path = Path(sys.argv[1], "src", f"cloudflared_quick_tunnel_{component}.py")
     compile(path.read_bytes(), str(path), "exec")
 PY
@@ -183,6 +189,7 @@ cat > "$manifest" <<'FILES'
 0755 src/cloudflared_quick_tunnel_daemon.py /usr/local/libexec/cloudflared-quick-tunnel-daemon
 0644 src/cloudflared_quick_tunnel_gateway.py /usr/local/libexec/cloudflared_quick_tunnel_gateway.py
 0644 src/cloudflared_quick_tunnel_terminal.py /usr/local/libexec/cloudflared_quick_tunnel_terminal.py
+0644 src/cloudflared_quick_tunnel_noise.py /usr/local/libexec/cloudflared_quick_tunnel_noise.py
 0644 src/cloudflared_quick_tunnel_qtty_holder.py /usr/local/libexec/cloudflared_quick_tunnel_qtty_holder.py
 0755 src/cloudflared_quick_tunnel_update.py /usr/local/libexec/cloudflared-quick-tunnel-update
 0644 revision /usr/local/share/cloudflared-quick-tunnel/revision

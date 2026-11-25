@@ -1,6 +1,16 @@
 # Cloudflared Quick Tunnel Tray
 
-## Quickstart
+## Install
+
+Choose **Install** in [TTY](https://robit-man.github.io/tty/) or download a package from the [latest release](https://github.com/robit-man/cloudflared-quick-tunnel-tray/releases/latest).
+
+- **macOS (Apple silicon or Intel)** — Open the matching `.dmg`, drag the app to Applications, and launch it. Enable **Remote Login** in System Settings → General → Sharing for Browser Terminal and select which accounts may log in.
+- **Windows (x64)** — Run the `.exe` installer and open the tray from Start. Browser Terminal uses a non-root user and OpenSSH in the default WSL 2 distribution. On Debian or Ubuntu in WSL, run `sudo apt install openssh-server python3-cryptography python3-websockets`, then `sudo service ssh start`. Use your WSL SSH username in TTY. The native SSH tunnel action targets the Windows OpenSSH server.
+- **Debian / Ubuntu (x64 or ARM64)** — Run `sudo apt install ./quick-tunnel-tray-linux-<arch>.deb` and open Cloudflare Quick Tunnel from your applications menu. Enable your local SSH server for Browser Terminal. Update this installation by installing the newer package with apt. For older `setup.sh` installations, keep using `setup.sh` or remove the source installation before switching to apt.
+
+macOS builds are ad hoc signed and Windows installers are unsigned. The release publishes SHA-256 checksums for all five downloads.
+
+## Linux setup from source
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/robit-man/cloudflared-quick-tunnel-tray/main/setup.sh | sh
@@ -12,7 +22,7 @@ the broker and your tray indicator. It uses `sudo` for system installation.
 
 [![CI](https://github.com/robit-man/cloudflared-quick-tunnel-tray/actions/workflows/ci.yml/badge.svg)](https://github.com/robit-man/cloudflared-quick-tunnel-tray/actions/workflows/ci.yml)
 
-A small Linux system service and tray indicator for creating disposable
+A tray app for creating disposable
 [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/).
 
 The default tray action publishes the host's SSH service on port 22. You can
@@ -21,7 +31,7 @@ also select any listening local TCP port, cycle to a new random
 Browser Terminal mode runs a WebSocket gateway for the same local SSH service.
 The browser uses a standalone static page and needs no `cloudflared` installation.
 
-## What it installs
+## What Linux installs
 
 - A hardened system service that brokers Quick Tunnels.
 - One isolated tunnel slot per Unix UID, authenticated with `SO_PEERCRED`.
@@ -35,14 +45,14 @@ processes. Browser Terminal mode requires a non-root requester and starts its
 gateway on a private IPv4 loopback port. SSH authentication uses the host's
 existing SSH daemon on `127.0.0.1:22`.
 
-## Requirements
+## Linux requirements
 
 - Linux with systemd and a desktop panel that supports AppIndicator
 - Python 3.10 or newer
 - `cloudflared`
 - `setpriv` from util-linux
 - GTK 3, PyGObject, Ayatana AppIndicator, and libnotify bindings
-- OpenSSH client and the system Python `websockets` package
+- OpenSSH client and the system Python `websockets` and `cryptography` packages
 - A running SSH daemon on `127.0.0.1:22` for Browser Terminal mode
 
 On other distributions, install the system dependencies before running setup.
@@ -64,7 +74,7 @@ start your tray immediately. The installer stops existing tray instances and
 the broker before replacing their files, then starts the updated services.
 Upgrading ends active tunnels and browser sessions.
 
-## Update from the tray
+## Update a Linux setup.sh installation
 
 The tray checks this repository’s GitHub `main` branch at startup and every 30
 minutes. It shows an update icon when the GitHub commit differs from the
@@ -153,13 +163,13 @@ Then point the application at `localhost:9000`.
 
 ## Browser Terminal
 
-1. Upload the standalone [index.html](index.html) to an HTTPS static host you trust.
-2. Choose **Start / cycle browser terminal** in the tray or run `cloudflared-quick-tunnelctl start --browser`.
-3. Choose **Copy browser terminal link**. Paste the full `https://…trycloudflare.com/#tty=…` link into the hosted page, enter your SSH username, and select **Connect**.
+1. Open [TTY](https://robit-man.github.io/tty/) in a current browser with Web Crypto X25519 support, such as Safari 18.4 or later. You can also host the standalone [index.html](index.html) on an HTTPS origin you trust.
+2. Choose **Start / cycle browser terminal** in the updated tray. On Linux, you can also run `cloudflared-quick-tunnelctl start --browser`.
+3. Choose **Copy browser terminal link**. Paste the full `https://…trycloudflare.com/#tty=v2.…` link into TTY, enter your SSH username, and select **Connect**. Cycle the tunnel to replace links from earlier versions.
 4. Complete the OpenSSH authentication prompt in the terminal. Use **Disconnect** to end the session, or **Stop tunnel** from the tray to close every attached session. Cycling ends all sessions and issues a fresh link.
 
-The tray lists a browser as soon as it passes the tunnel token check. The
-displayed SSH username comes from the browser's login request. The browser
+On Linux, the tray lists browsers after the encrypted login request. The
+displayed SSH username comes from the browser's encrypted login request. The browser
 and its PTY both close when you end that entry.
 
 Sessions survive network changes. Moving a phone from Wi-Fi to cellular, or
@@ -170,8 +180,9 @@ the browser reports a network or visibility change. When a check fails, it
 opens a new WebSocket and resumes the same PTY. Missed output is replayed from
 the last byte the page received. Keys typed while offline are sent once the
 session resumes, and the gateway's input count stops any byte from being typed
-twice. The tray shows a detached session as waiting to reconnect. **Disconnect**,
-closing the tab, and **End session** still close the PTY immediately.
+twice. The Linux tray shows a detached session as waiting to reconnect.
+**Disconnect** and **End session** close the PTY. If the browser closes before
+it can deliver the encrypted disconnect, the gateway uses the same timeout.
 
 On touch screens, drag with two fingers to scroll. The page delivers the
 gesture as mouse-wheel input, the same as a desktop wheel or trackpad, so
@@ -181,7 +192,7 @@ shell scrolls the local scrollback.
 
 ### Saved sessions with qtty
 
-Browser logins open in `qtty`, so a terminal keeps running after you close
+Linux browser logins open in `qtty`, so a terminal keeps running after you close
 the tab, lose the network for longer than 15 minutes, or cycle the tunnel.
 Each pane remembers its session. Press Enter in a disconnected pane, sign in,
 and the pane returns to the same session with its screen restored. After a
@@ -236,17 +247,24 @@ SSH still requires SSH authentication, but a custom TCP service may not have
 authentication of its own. Do not publish an unauthenticated administrative,
 database, or development port.
 
-Treat the Browser Terminal link as a secret. The token stays in the pasted
-link's fragment and travels in the initial WebSocket message. The upgrade URL
-contains only the hostname and `/ws`. After login, the gateway gives the page a
-random secret for that session only. The page keeps it in memory and uses it
-to resume. It never goes in the URL or browser storage, and stops working when
-the session ends or the tunnel cycles. Every browser login requires SSH
-authentication. A fork reuses an authenticated login through an OpenSSH
-control socket in the gateway's private directory. The fork request must
-present that pane's session secret. The control connection closes 60 seconds
-after its last terminal. The static page and Cloudflare are in the browser
-connection's trust path.
+Treat the version 2 Browser Terminal link as a secret. Share it through a
+trusted channel and paste it into a TTY page you trust. The fragment contains
+a random, 32-byte pre-shared key. The browser and gateway use
+[Noise NNpsk0](https://noiseprotocol.org/noise.html#handshake-patterns)
+with ephemeral X25519, AES-256-GCM, and SHA-256 on every WebSocket, including
+resume and fork. The key stays at the endpoints. The handshake must succeed
+before the gateway accepts a login, and v2 rejects the old plaintext route.
+Cloudflare relays encrypted frames and can see metadata such as the hostname,
+timing, and sizes. The gateway decrypts terminal traffic on the host and runs
+OpenSSH with local host-key verification. TTY's Recents saves links in that
+site's browser storage.
+
+After login, the gateway gives the browser a separate per-session resume
+secret over the encrypted connection. The browser keeps it in memory until
+the session ends. The gateway still requires SSH authentication. A fork
+uses the parent session's secret and reuses its authenticated OpenSSH control
+socket while it is available. The control connection closes 60 seconds
+after its last terminal.
 
 qtty keeps its socket in `/tmp/qtty-UID`, and refuses to start unless the
 directory is mode 700 and owned by you. The holder also checks each client's
@@ -259,6 +277,13 @@ the system service restarts.
 
 For a stable production hostname and Cloudflare Access policy, use a named
 Cloudflare Tunnel instead of a Quick Tunnel.
+
+## Releases
+
+Push a version tag such as `v2.0.0` to build and publish the two macOS disk
+images, Windows installer, two Debian packages, and checksum file. Every
+installer includes a version and checksum-pinned Cloudflare binary. Tagged CI
+builds the artifacts on their target platforms before publishing the release.
 
 ## Service operations
 
